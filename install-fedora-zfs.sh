@@ -26,9 +26,19 @@
 # Requires: zfs/zpool, dnf or an extracted Fedora rootfs, sgdisk, mkdosfs,
 #           chroot, internet
 #
-# Usage: sudo ./install-fedora-zfs.sh
+# Usage: sudo ./install-fedora-zfs.sh [--resume]
+#   --resume  Skip completed phases and continue from last checkpoint
 ###############################################################################
 set -euo pipefail
+
+# ─── Script transcript capture ──────────────────────────────────────────────
+# Re-exec through `script` to capture the full raw terminal transcript
+# (including any interactive prompts) in addition to the tee'd log.
+TYPESCRIPT="/var/log/install-fedora-zfs-$(date +%Y%m%d-%H%M%S).typescript"
+if [[ -z "${INSIDE_SCRIPT_WRAPPER:-}" ]]; then
+    export INSIDE_SCRIPT_WRAPPER=1
+    exec script -efq "$TYPESCRIPT" -c "$(printf '%q ' "$0" "$@")"
+fi
 
 # ─── Log file ───────────────────────────────────────────────────────────────
 LOGFILE="/var/log/install-fedora-zfs-$(date +%Y%m%d-%H%M%S).log"
@@ -72,6 +82,28 @@ ESP_SIZE="512M"
 BOOT_POOL_SIZE="1G"
 ROOT_POOL_SIZE="65536M"              # 64 GiB exactly (65536 MiB)
 SWAP_SIZE="4G"
+
+# ─── Checkpoint / resume ───────────────────────────────────────────────────
+STATEFILE="/tmp/.install-state-fedora-zfs"
+RESUME=false
+for arg in "$@"; do
+    case "$arg" in
+        --resume) RESUME=true ;;
+    esac
+done
+
+# Read the last completed phase (0 = none completed)
+completed_phase() { cat "$STATEFILE" 2>/dev/null || echo 0; }
+# Mark a phase as completed
+mark_phase()      { echo "$1" > "$STATEFILE"; }
+# Return true if a phase should be skipped (already completed in a prior run)
+skip_phase() {
+    local n=$1
+    if $RESUME && (( n <= $(completed_phase) )); then
+        return 0   # skip
+    fi
+    return 1       # run
+}
 
 # ─── Colours & logging ─────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -131,6 +163,12 @@ done
 
 info "Target disk: $DISK -> $(readlink -f "$DISK")"
 info "Log file:    $LOGFILE"
+info "Transcript:  $TYPESCRIPT"
+if $RESUME; then
+    info "Resume mode: ON — last completed phase: $(completed_phase)"
+else
+    info "Resume mode: OFF (use --resume to continue a failed run)"
+fi
 info "This will DESTROY ALL DATA on the disk."
 info ""
 info "Partition plan:"
@@ -145,6 +183,9 @@ read -rp "Type YES to continue: " confirm
 ###############################################################################
 # PHASE 1: Disk Preparation
 ###############################################################################
+if skip_phase 1; then
+    info "PHASE 1: Disk Preparation — SKIPPED (already completed)"
+else
 phase "PHASE 1: Disk Preparation"
 
 # Ensure nothing is mounted from this disk
@@ -189,10 +230,27 @@ sleep 2
 info "Partition layout:"
 sgdisk -p "$(readlink -f "$DISK")"
 info "Partitioning complete."
+mark_phase 1
+fi  # end Phase 1
 
 ###############################################################################
 # PHASE 2: Create ZFS Pools
 ###############################################################################
+if skip_phase 2; then
+    info "PHASE 2: Create ZFS Pools — SKIPPED (already completed)"
+    # Re-import existing pools for subsequent phases
+    if ! zpool list bpool &>/dev/null; then
+        info "Re-importing bpool..."
+        zpool import -N -d /dev/disk/by-id bpool -R "$MNT" \
+            || error "Cannot re-import bpool. Run without --resume to start fresh."
+    fi
+    if ! zpool list rpool &>/dev/null; then
+        info "Re-importing rpool (you may need to enter the passphrase)..."
+        zpool import -N -d /dev/disk/by-id rpool -R "$MNT" \
+            || error "Cannot re-import rpool. Run without --resume to start fresh."
+        zfs load-key rpool || error "Could not load rpool encryption key."
+    fi
+else
 phase "PHASE 2: Create ZFS Pools"
 
 # Format ESP
@@ -227,10 +285,21 @@ zpool create \
     -O relatime=on \
     -O canmount=off -O mountpoint=/ -R "$MNT" \
     rpool "${DISK}-part3"
+mark_phase 2
+fi  # end Phase 2
 
 ###############################################################################
 # PHASE 3: Create ZFS Datasets
 ###############################################################################
+if skip_phase 3; then
+    info "PHASE 3: Create ZFS Datasets — SKIPPED (already completed)"
+    # Ensure datasets are mounted for subsequent phases
+    zfs mount rpool/ROOT/fedora 2>/dev/null || true
+    zfs mount -a 2>/dev/null || true
+    mkdir -p "$MNT/run"
+    mountpoint -q "$MNT/run" || mount -t tmpfs tmpfs "$MNT/run"
+    mkdir -p "$MNT/run/lock"
+else
 phase "PHASE 3: Create ZFS Datasets"
 
 # Root and boot filesystem containers
@@ -278,10 +347,15 @@ mkdir -p "$MNT/run/lock"
 
 info "ZFS datasets created."
 zfs list -r rpool bpool
+mark_phase 3
+fi  # end Phase 3
 
 ###############################################################################
 # PHASE 4: Install Fedora Base System
 ###############################################################################
+if skip_phase 4; then
+    info "PHASE 4: Install Fedora Base System — SKIPPED (already completed)"
+else
 phase "PHASE 4: Install Fedora Base System"
 
 # Strategy: Extract rootfs from the Fedora Live ISO squashfs, or use dnf.
@@ -396,10 +470,15 @@ mkdir -p "$MNT"/{dev,proc,sys,run,tmp,boot,boot/efi,etc/zfs}
 
 # Copy zpool cache
 cp /etc/zfs/zpool.cache "$MNT/etc/zfs/" 2>/dev/null || true
+mark_phase 4
+fi  # end Phase 4
 
 ###############################################################################
 # PHASE 5: System Configuration (chroot)
 ###############################################################################
+if skip_phase 5; then
+    info "PHASE 5: System Configuration — SKIPPED (already completed)"
+else
 phase "PHASE 5: System Configuration"
 
 # Hostname
@@ -729,10 +808,15 @@ chroot "$MNT" /usr/bin/env bash /tmp/chroot-setup.sh
 
 # Clean up the script
 rm -f "$MNT/tmp/chroot-setup.sh"
+mark_phase 5
+fi  # end Phase 5
 
 ###############################################################################
 # PHASE 6: Verify Secure Boot Chain
 ###############################################################################
+if skip_phase 6; then
+    info "PHASE 6: Verify Secure Boot Chain — SKIPPED (already completed)"
+else
 phase "PHASE 6: Verify Secure Boot Chain"
 
 # Check that the shim and signed GRUB are in place
@@ -779,6 +863,8 @@ info "ESP contents:"
 find "$MNT/boot/efi/" -type f \( -name "*.efi" -o -name "*.EFI" \) 2>/dev/null | sort | while read -r f; do
     info "  $(echo "$f" | sed "s|$MNT/boot/efi/||")"
 done
+mark_phase 6
+fi  # end Phase 6
 
 ###############################################################################
 # PHASE 7: Snapshot & Cleanup
@@ -801,6 +887,10 @@ umount -lf "$MNT/run" 2>/dev/null || true
 info "Exporting ZFS pools..."
 zpool export bpool || warn "Could not export bpool cleanly"
 zpool export rpool || warn "Could not export rpool cleanly"
+
+# Mark all phases complete and remove state file (clean finish)
+mark_phase 7
+rm -f "$STATEFILE"
 
 ###############################################################################
 # Done!
