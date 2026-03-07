@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 ###############################################################################
 # Portable Kali Linux on ZFS — Full Installer
-# Target: USB SSD /dev/sda (EAGET enclosure, Samsung MZNLN128)
+# Target: USB SSD (Samsung MZNLN128 in RTL9210 enclosure)
 #
 # Based on: OpenZFS "Debian Trixie Root on ZFS" guide (Dec 2025)
 #           Adapted for Kali Linux (kali-rolling, Debian Testing/Trixie based)
@@ -66,11 +66,11 @@ trap 'trap_handler "$LINENO" "$BASH_COMMAND" "$?"' ERR
 # and is the most stable identifier. It survives enclosure swaps, USB port
 # changes, and works on any machine that can see the drive's identity.
 # Fallbacks are checked automatically if WWN isn't available.
-DISK_WWN="/dev/disk/by-id/wwn-0x5002538d42a0e220"
-DISK_ATA="/dev/disk/by-id/ata-SAMSUNG_MZNLN128HAHQ-000H1_S3T8NF0K250172"
-DISK_USB="/dev/disk/by-id/usb-EAGET_EAGET_012345686297-0:0"
+DISK_WWN="/dev/disk/by-id/wwn-0x5002538d006b1ef3"
+DISK_ATA="/dev/disk/by-id/ata-SAMSUNG_MZNLN128HAHQ-000H1_S3T8NE1K664564"
+DISK_USB="/dev/disk/by-id/usb-SAMSUNG_MZNLN128HAHQ-000_012345678999-0:0"
 DISK=""  # resolved below
-DISK_SHORT="/dev/sda"                # for display only
+DISK_DEV=""  # resolved at runtime via readlink -f "$DISK"
 MNT="/mnt/kali"                      # mountpoint for the new system
 HOSTNAME_KALI="kali-portable"
 KALI_MIRROR="https://http.kali.org/kali"
@@ -131,10 +131,17 @@ else
     error "Disk not found via any known identifier. Is the USB SSD plugged in?"
 fi
 
+# Resolve the actual block device path (e.g. /dev/sdX) for unmount operations
+DISK_DEV="$(readlink -f "$DISK")"
+
 # Verify ZFS module
 lsmod | grep -q '^zfs' || modprobe zfs || error "ZFS kernel module not available."
 
-# Check required tools — install debootstrap if missing (Arch/CachyOS)
+# Check required tools — install missing ones on Arch/CachyOS
+if ! command -v sgdisk &>/dev/null; then
+    info "sgdisk not found — installing gptfdisk via pacman..."
+    pacman -S --noconfirm gptfdisk || error "Failed to install gptfdisk (provides sgdisk)"
+fi
 if ! command -v debootstrap &>/dev/null; then
     info "debootstrap not found — installing via pacman..."
     pacman -S --noconfirm debootstrap || error "Failed to install debootstrap"
@@ -174,7 +181,7 @@ phase "PHASE 1: Disk Preparation"
 # Ensure nothing is mounted from this disk
 info "Unmounting any existing mounts from target disk..."
 swapoff --all 2>/dev/null || true
-umount -lf "${DISK_SHORT}"* 2>/dev/null || true
+umount -lf "${DISK_DEV}"* 2>/dev/null || true
 
 # Check if any zpool is using this disk and export it
 for pool in $(zpool list -H -o name 2>/dev/null); do
@@ -185,13 +192,22 @@ for pool in $(zpool list -H -o name 2>/dev/null); do
 done
 
 # Destroy any pre-existing bpool/rpool (from a previous failed run)
+# Safety: only destroy pools that live on OUR target disk.
+# If a pool with the same name exists on a different disk, abort.
+TARGET_BASENAME="$(basename "$DISK_DEV")"
 for p in bpool rpool; do
     if zpool list "$p" &>/dev/null; then
-        warn "Pool '$p' already exists — destroying..."
-        zfs unmount -a -f 2>/dev/null || true
-        umount -Rlf "$MNT" 2>/dev/null || true
-        zpool destroy -f "$p" 2>/dev/null || \
-            warn "Could not destroy $p — if the script fails at pool creation, reboot and retry."
+        POOL_VDEV="$(zpool status "$p" 2>/dev/null | grep -oP '(sd[a-z]+|nvme\S+)' | head -1)"
+        if [[ "$POOL_VDEV" == "$TARGET_BASENAME"* ]]; then
+            warn "Pool '$p' already exists on this disk — destroying (previous failed run)..."
+            zfs unmount -a -f 2>/dev/null || true
+            umount -Rlf "$MNT" 2>/dev/null || true
+            zpool destroy -f "$p" 2>/dev/null || \
+                warn "Could not destroy $p — if the script fails at pool creation, reboot and retry."
+        else
+            error "Pool '$p' is already imported from a DIFFERENT disk (vdev: $POOL_VDEV)." \
+                  "Unplug the other ZFS drive or 'zpool export $p' first."
+        fi
     fi
 done
 
@@ -367,12 +383,23 @@ mark_phase 4
 fi  # end Phase 4
 
 ###############################################################################
-# PHASE 5: System Configuration (chroot)
+# PHASE 5a: System Configuration — Base Setup (chroot)
 ###############################################################################
+# Phase 5 is split into sub-phases (5a–5e) so --resume can recover from
+# failures mid-install (especially network-dependent apt operations).
+
+# ─── Helper: bind-mount virtual filesystems for chroot ──────────────────────
+setup_chroot_mounts() {
+    mountpoint -q "$MNT/dev"  || mount --make-private --rbind /dev  "$MNT/dev"
+    mountpoint -q "$MNT/proc" || mount --make-private --rbind /proc "$MNT/proc"
+    mountpoint -q "$MNT/sys"  || mount --make-private --rbind /sys  "$MNT/sys"
+    cp /etc/resolv.conf "$MNT/etc/resolv.conf" 2>/dev/null || true
+}
+
 if skip_phase 5; then
-    info "PHASE 5: System Configuration — SKIPPED (already completed)"
+    info "PHASE 5a: Base Setup — SKIPPED (already completed)"
 else
-phase "PHASE 5: System Configuration"
+phase "PHASE 5a: System Configuration — Base Setup"
 
 # Hostname
 echo "$HOSTNAME_KALI" > "$MNT/etc/hostname"
@@ -390,19 +417,11 @@ deb $KALI_MIRROR $KALI_SUITE main contrib non-free non-free-firmware
 deb-src $KALI_MIRROR $KALI_SUITE main contrib non-free non-free-firmware
 EOF
 
-# Bind mount virtual filesystems
-mount --make-private --rbind /dev  "$MNT/dev"
-mount --make-private --rbind /proc "$MNT/proc"
-mount --make-private --rbind /sys  "$MNT/sys"
+setup_chroot_mounts
 
-# Ensure DNS works inside chroot
-cp /etc/resolv.conf "$MNT/etc/resolv.conf" 2>/dev/null || true
+info "Entering chroot for base setup..."
 
-# ─── Enter chroot ───────────────────────────────────────────────────────────
-info "Entering chroot to configure system..."
-
-# Create the chroot configuration script
-cat > "$MNT/tmp/chroot-setup.sh" <<'CHROOT_EOF'
+cat > "$MNT/tmp/chroot-5a.sh" <<'CHROOT_EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 trap 'echo ""; echo "[chroot] FATAL: command failed (exit $?) at line $LINENO: $BASH_COMMAND"; exit 1' ERR
@@ -413,23 +432,36 @@ export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export DISK="__DISK__"
 
+# ── apt retry wrapper — retries up to 3 times on transient failures ─────────
+apt_retry() {
+    local attempt max_attempts=3
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        if apt-get "$@"; then
+            return 0
+        fi
+        echo "[chroot] apt-get failed (attempt $attempt/$max_attempts) — retrying in 10s..."
+        sleep 10
+        apt-get update -qq 2>/dev/null || true
+    done
+    echo "[chroot] apt-get failed after $max_attempts attempts"
+    return 1
+}
+
 # ── Hostid for portable ZFS ─────────────────────────────────────────────────
-# Generate a stable hostid and bake it into the system.  ZFS uses the hostid
-# to detect "foreign" pools.  Because this is a portable drive we pick
-# a fixed random value so it is consistent across boots on *any* machine.
+# ZFS stamps the creator's hostid onto pools. The pools were created by the
+# host machine (Phase 2), so we must use the SAME hostid here — otherwise
+# initramfs will refuse to import the pool ("pool was created by another
+# system"). We read __HOSTID__ which was captured from the host before chroot.
 echo "[chroot] Setting up stable hostid for portable ZFS..."
-HOSTID="$(printf '%08x' $((RANDOM * RANDOM)))"
+HOSTID="__HOSTID__"
 printf "\\x${HOSTID:6:2}\\x${HOSTID:4:2}\\x${HOSTID:2:2}\\x${HOSTID:0:2}" > /etc/hostid
 
-# Ensure hostid is included in initramfs for portable pool imports
 mkdir -p /etc/initramfs-tools/hooks
 cat > /etc/initramfs-tools/hooks/zfs-hostid <<'HOOKEOF'
 #!/bin/sh
 PREREQ=""
 prereqs() { echo "$PREREQ"; }
 case $1 in prereqs) prereqs; exit 0;; esac
-# copy_file requires a type from a fixed set; hostid is not one of them.
-# Use plain cp instead so the hook never fails.
 if [ -f /etc/hostid ]; then
     mkdir -p "$DESTDIR/etc"
     cp /etc/hostid "$DESTDIR/etc/hostid"
@@ -440,61 +472,97 @@ chmod +x /etc/initramfs-tools/hooks/zfs-hostid
 echo "[chroot] Updating packages..."
 apt-get update
 
-# Set global dpkg non-interactive options for all apt-get calls
 mkdir -p /etc/apt/apt.conf.d
 cat > /etc/apt/apt.conf.d/99-noninteractive <<'APTEOF'
 Dpkg::Options { "--force-confdef"; "--force-confold"; }
 APTEOF
 
 echo "[chroot] Installing core packages..."
-apt-get install --yes --no-install-recommends \
+apt_retry install --yes --no-install-recommends \
     locales console-setup keyboard-configuration tzdata
 
-# Configure locale
 sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
 locale-gen
 update-locale LANG=en_US.UTF-8
 
-# Timezone (UTC is safe default for portable)
 ln -sf /usr/share/zoneinfo/UTC /etc/localtime
 dpkg-reconfigure -f noninteractive tzdata
 
+echo "[chroot] Phase 5a complete."
+CHROOT_EOF
+
+sed -i "s|__DISK__|${DISK}|g" "$MNT/tmp/chroot-5a.sh"
+sed -i "s|__HOSTID__|$(hostid)|g" "$MNT/tmp/chroot-5a.sh"
+chmod +x "$MNT/tmp/chroot-5a.sh"
+chroot "$MNT" /usr/bin/env bash /tmp/chroot-5a.sh
+rm -f "$MNT/tmp/chroot-5a.sh"
+mark_phase 5
+fi  # end Phase 5a
+
+###############################################################################
+# PHASE 5b: ZFS, Kernel, and Boot Setup (chroot)
+###############################################################################
+if skip_phase 6; then
+    info "PHASE 5b: ZFS & Kernel — SKIPPED (already completed)"
+else
+phase "PHASE 5b: ZFS, Kernel, and Boot Setup"
+
+setup_chroot_mounts
+
+cat > "$MNT/tmp/chroot-5b.sh" <<'CHROOT_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'echo ""; echo "[chroot] FATAL: command failed (exit $?) at line $LINENO: $BASH_COMMAND"; exit 1' ERR
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export DISK="__DISK__"
+
+apt_retry() {
+    local attempt max_attempts=3
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        if apt-get "$@"; then return 0; fi
+        echo "[chroot] apt-get failed (attempt $attempt/$max_attempts) — retrying in 10s..."
+        sleep 10; apt-get update -qq 2>/dev/null || true
+    done
+    echo "[chroot] apt-get failed after $max_attempts attempts"; return 1
+}
+
 echo "[chroot] Installing ZFS and kernel..."
-# Install kernel headers first (workaround for bug #1091428)
-apt-get install --yes linux-headers-amd64
-apt-get install --yes linux-image-amd64
-apt-get install --yes zfs-initramfs zfsutils-linux
+apt_retry install --yes linux-headers-amd64
+apt_retry install --yes linux-image-amd64
+apt_retry install --yes zfs-initramfs zfsutils-linux
 mkdir -p /etc/dkms
 echo "REMAKE_INITRD=yes" > /etc/dkms/zfs.conf
 
 echo "[chroot] Installing NTP..."
-apt-get install --yes systemd-timesyncd
+apt_retry install --yes systemd-timesyncd
 
 echo "[chroot] Setting up ESP and GRUB..."
-apt-get install --yes dosfstools
+apt_retry install --yes dosfstools
 mkdir -p /boot/efi
 
-# Mount ESP and add to fstab
 ESP_UUID=$(blkid -s UUID -o value ${DISK}-part1)
-echo "UUID=${ESP_UUID} /boot/efi vfat defaults 0 0" >> /etc/fstab
-mount /boot/efi
+# Avoid duplicate fstab entries on --resume re-runs
+grep -q "$ESP_UUID" /etc/fstab 2>/dev/null || \
+    echo "UUID=${ESP_UUID} /boot/efi vfat defaults 0 0" >> /etc/fstab
+mountpoint -q /boot/efi || mount /boot/efi
 
 echo "[chroot] Installing GRUB + Secure Boot shim..."
-apt-get install --yes grub-efi-amd64 grub-efi-amd64-signed shim-signed
+apt_retry install --yes grub-efi-amd64 shim-signed
 
 echo "[chroot] Removing os-prober (not needed)..."
 apt-get purge --yes os-prober 2>/dev/null || true
 
 echo "[chroot] Configuring swap..."
 mkswap -f /dev/zvol/rpool/swap
-echo "/dev/zvol/rpool/swap none swap discard 0 0" >> /etc/fstab
+grep -q 'rpool/swap' /etc/fstab 2>/dev/null || \
+    echo "/dev/zvol/rpool/swap none swap discard 0 0" >> /etc/fstab
 echo "RESUME=none" > /etc/initramfs-tools/conf.d/resume
 
 echo "[chroot] Creating bpool import service..."
-# Use -d /dev/disk/by-id so ZFS scans ALL available identifiers (wwn-, ata-,
-# usb-) when looking for the bpool. This is critical for a portable drive —
-# different machines may expose different by-id names depending on their USB
-# controller and whether ATA passthrough works.
 cat > /etc/systemd/system/zfs-import-bpool.service <<'SVCEOF'
 [Unit]
 DefaultDependencies=no
@@ -505,7 +573,6 @@ Before=zfs-import-cache.service
 Type=oneshot
 RemainAfterExit=yes
 ExecStart=/sbin/zpool import -N -o cachefile=none -d /dev/disk/by-id bpool
-# Work-around to preserve zpool cache:
 ExecStartPre=-/bin/mv /etc/zfs/zpool.cache /etc/zfs/preboot_zpool.cache
 ExecStartPost=-/bin/mv /etc/zfs/preboot_zpool.cache /etc/zfs/zpool.cache
 
@@ -514,8 +581,48 @@ WantedBy=zfs-import.target
 SVCEOF
 systemctl enable zfs-import-bpool.service
 
+echo "[chroot] Phase 5b complete."
+CHROOT_EOF
+
+sed -i "s|__DISK__|${DISK}|g" "$MNT/tmp/chroot-5b.sh"
+chmod +x "$MNT/tmp/chroot-5b.sh"
+chroot "$MNT" /usr/bin/env bash /tmp/chroot-5b.sh
+rm -f "$MNT/tmp/chroot-5b.sh"
+mark_phase 6
+fi  # end Phase 5b
+
+###############################################################################
+# PHASE 5c: Desktop & Packages (chroot) — largest download phase
+###############################################################################
+if skip_phase 7; then
+    info "PHASE 5c: Desktop & Packages — SKIPPED (already completed)"
+else
+phase "PHASE 5c: Desktop Environment & Packages"
+
+setup_chroot_mounts
+
+cat > "$MNT/tmp/chroot-5c.sh" <<'CHROOT_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'echo ""; echo "[chroot] FATAL: command failed (exit $?) at line $LINENO: $BASH_COMMAND"; exit 1' ERR
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+
+apt_retry() {
+    local attempt max_attempts=3
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        if apt-get "$@"; then return 0; fi
+        echo "[chroot] apt-get failed (attempt $attempt/$max_attempts) — retrying in 10s..."
+        sleep 10; apt-get update -qq 2>/dev/null || true
+    done
+    echo "[chroot] apt-get failed after $max_attempts attempts"; return 1
+}
+
 echo "[chroot] Installing NetworkManager + firmware..."
-apt-get install --yes \
+apt_retry install --yes \
     network-manager \
     firmware-linux \
     firmware-linux-nonfree \
@@ -527,13 +634,14 @@ apt-get install --yes \
     wpasupplicant
 
 echo "[chroot] Installing KDE Plasma + Kali tools..."
-apt-get install --yes \
+echo "[chroot] This is the largest download (~8-15 GB) — may take a while..."
+apt_retry install --yes \
     kali-desktop-kde \
     kali-linux-default \
     kali-tools-top10
 
 echo "[chroot] Installing extra useful packages..."
-apt-get install --yes \
+apt_retry install --yes \
     openssh-server \
     sudo \
     vim \
@@ -551,6 +659,33 @@ apt-get install --yes \
     plymouth \
     plymouth-themes
 
+echo "[chroot] Phase 5c complete."
+CHROOT_EOF
+
+chmod +x "$MNT/tmp/chroot-5c.sh"
+chroot "$MNT" /usr/bin/env bash /tmp/chroot-5c.sh
+rm -f "$MNT/tmp/chroot-5c.sh"
+mark_phase 7
+fi  # end Phase 5c
+
+###############################################################################
+# PHASE 5d: GRUB, Initramfs & Boot Finalization (chroot)
+###############################################################################
+if skip_phase 8; then
+    info "PHASE 5d: Boot Finalization — SKIPPED (already completed)"
+else
+phase "PHASE 5d: GRUB, Initramfs & Boot Finalization"
+
+setup_chroot_mounts
+
+cat > "$MNT/tmp/chroot-5d.sh" <<'CHROOT_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'echo ""; echo "[chroot] FATAL: command failed (exit $?) at line $LINENO: $BASH_COMMAND"; exit 1' ERR
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export DEBIAN_FRONTEND=noninteractive
+
 echo "[chroot] Configuring GRUB..."
 cat > /etc/default/grub <<'GRUBEOF'
 GRUB_DEFAULT=0
@@ -562,29 +697,27 @@ GRUB_TERMINAL=console
 GRUB_DISABLE_OS_PROBER=true
 GRUBEOF
 
+# Remove any stale zpool.cache before rebuilding initramfs — for a portable
+# drive we rely on scan-based import (zfs-import-bpool.service + initramfs
+# scanning /dev/disk/by-id), not cache-based import with fixed device paths.
+rm -f /etc/zfs/zpool.cache
+
 echo "[chroot] Updating initramfs..."
 update-initramfs -c -k all
 
 echo "[chroot] Installing GRUB to ESP (portable + Secure Boot)..."
-# --removable writes to EFI/BOOT/BOOTX64.EFI so any UEFI machine can find it
-# without needing an NVRAM boot entry (critical for portable drives)
+mountpoint -q /boot/efi || mount /boot/efi
 grub-install --target=x86_64-efi --efi-directory=/boot/efi \
     --bootloader-id=kali --recheck --no-floppy --removable
 
-# Ensure the Secure Boot shim is placed correctly at the fallback path.
-# On Debian/Kali, shim-signed installs shimx64.efi. For portable Secure Boot
-# to work, shimx64.efi must be at EFI/BOOT/BOOTX64.EFI and it must chainload
-# grubx64.efi from the same directory.
+# grub-install --removable places the GRUB binary at EFI/BOOT/BOOTX64.EFI.
+# For Secure Boot, shim must be at BOOTX64.EFI and chain-load grubx64.efi.
+# So: rename the GRUB binary to grubx64.efi, then put shim at BOOTX64.EFI.
 if [[ -f /usr/lib/shim/shimx64.efi.signed ]]; then
+    mv /boot/efi/EFI/BOOT/BOOTX64.EFI /boot/efi/EFI/BOOT/grubx64.efi
     cp /usr/lib/shim/shimx64.efi.signed /boot/efi/EFI/BOOT/BOOTX64.EFI
-    # Also place the MOK manager
     cp /usr/lib/shim/mmx64.efi.signed /boot/efi/EFI/BOOT/mmx64.efi 2>/dev/null || true
-    # grubx64.efi should already be at EFI/BOOT/ from --removable
-    if [[ ! -f /boot/efi/EFI/BOOT/grubx64.efi ]]; then
-        cp /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed \
-           /boot/efi/EFI/BOOT/grubx64.efi 2>/dev/null || true
-    fi
-    echo "[chroot] Secure Boot shim installed at EFI/BOOT/BOOTX64.EFI"
+    echo "[chroot] Secure Boot chain: BOOTX64.EFI (shim) -> grubx64.efi (GRUB)"
 fi
 
 update-grub
@@ -594,12 +727,10 @@ mkdir -p /etc/zfs/zfs-list.cache
 touch /etc/zfs/zfs-list.cache/bpool
 touch /etc/zfs/zfs-list.cache/rpool
 
-# Start zed to populate cache, then stop it
 zed -F &
 ZED_PID=$!
 sleep 3
 
-# Force cache update
 zfs set canmount=on     bpool/BOOT/kali 2>/dev/null || true
 zfs set canmount=noauto rpool/ROOT/kali 2>/dev/null || true
 sleep 2
@@ -607,7 +738,6 @@ sleep 2
 kill "$ZED_PID" 2>/dev/null || true
 wait "$ZED_PID" 2>/dev/null || true
 
-# Fix mountpoint paths (remove /mnt/kali prefix from zfs-list.cache)
 sed -Ei "s|/mnt/kali/?|/|" /etc/zfs/zfs-list.cache/* 2>/dev/null || true
 
 echo "[chroot] Enabling essential services..."
@@ -622,6 +752,32 @@ systemctl enable zfs-zed
 echo "[chroot] Cleaning apt cache to save space..."
 apt-get clean
 
+echo "[chroot] Phase 5d complete."
+CHROOT_EOF
+
+chmod +x "$MNT/tmp/chroot-5d.sh"
+chroot "$MNT" /usr/bin/env bash /tmp/chroot-5d.sh
+rm -f "$MNT/tmp/chroot-5d.sh"
+mark_phase 8
+fi  # end Phase 5d
+
+###############################################################################
+# PHASE 5e: User Account Setup (interactive, chroot)
+###############################################################################
+if skip_phase 9; then
+    info "PHASE 5e: User Setup — SKIPPED (already completed)"
+else
+phase "PHASE 5e: User Account Setup"
+
+setup_chroot_mounts
+
+cat > "$MNT/tmp/chroot-5e.sh" <<'CHROOT_EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+trap 'echo ""; echo "[chroot] FATAL: command failed (exit $?) at line $LINENO: $BASH_COMMAND"; exit 1' ERR
+
+export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+
 echo "[chroot] Setting root password..."
 echo "Set the root password for your Kali installation:"
 passwd
@@ -631,30 +787,41 @@ echo "Create a regular user account:"
 read -rp "Username: " USERNAME
 adduser "$USERNAME"
 usermod -aG sudo,audio,cdrom,dip,floppy,netdev,plugdev,video "$USERNAME"
-# Create ZFS home dataset for user
+# Create ZFS home dataset for user FIRST (empty), then populate it
 zfs create "rpool/home/$USERNAME" 2>/dev/null || true
-cp -a /etc/skel/. "/home/$USERNAME/" 2>/dev/null || true
+# The dataset is now mounted at /home/$USERNAME — copy skel into it
+cp -a /etc/skel/. "/home/$USERNAME/"
+# Create standard XDG directories
+mkdir -p "/home/$USERNAME"/{Desktop,Documents,Downloads,Music,Pictures,Videos,Public,Templates}
+mkdir -p "/home/$USERNAME/.config"
+cat > "/home/$USERNAME/.config/user-dirs.dirs" <<'XDGEOF'
+XDG_DESKTOP_DIR="$HOME/Desktop"
+XDG_DOWNLOAD_DIR="$HOME/Downloads"
+XDG_TEMPLATES_DIR="$HOME/Templates"
+XDG_PUBLICSHARE_DIR="$HOME/Public"
+XDG_DOCUMENTS_DIR="$HOME/Documents"
+XDG_MUSIC_DIR="$HOME/Music"
+XDG_PICTURES_DIR="$HOME/Pictures"
+XDG_VIDEOS_DIR="$HOME/Videos"
+XDGEOF
 chown -R "$USERNAME:$USERNAME" "/home/$USERNAME"
+
+# Rebuild desktop application database so app launcher works on first boot
+update-desktop-database /usr/share/applications 2>/dev/null || true
 
 echo "[chroot] Configuration complete!"
 CHROOT_EOF
 
-# Replace the DISK placeholder
-sed -i "s|__DISK__|${DISK}|g" "$MNT/tmp/chroot-setup.sh"
-chmod +x "$MNT/tmp/chroot-setup.sh"
-
-# Run the chroot script
-chroot "$MNT" /usr/bin/env bash /tmp/chroot-setup.sh
-
-# Clean up the script
-rm -f "$MNT/tmp/chroot-setup.sh"
-mark_phase 5
-fi  # end Phase 5
+chmod +x "$MNT/tmp/chroot-5e.sh"
+chroot "$MNT" /usr/bin/env bash /tmp/chroot-5e.sh
+rm -f "$MNT/tmp/chroot-5e.sh"
+mark_phase 9
+fi  # end Phase 5e
 
 ###############################################################################
 # PHASE 6: Verify Secure Boot Chain
 ###############################################################################
-if skip_phase 6; then
+if skip_phase 10; then
     info "PHASE 6: Verify Secure Boot Chain — SKIPPED (already completed)"
 else
 phase "PHASE 6: Verify Secure Boot Chain"
@@ -703,7 +870,7 @@ info "ESP contents:"
 find "$MNT/boot/efi/" -type f \( -name "*.efi" -o -name "*.EFI" \) 2>/dev/null | sort | while read -r f; do
     info "  $(echo "$f" | sed "s|$MNT/boot/efi/||")"
 done
-mark_phase 6
+mark_phase 10
 fi  # end Phase 6
 
 ###############################################################################
@@ -729,7 +896,7 @@ zpool export bpool || warn "Could not export bpool cleanly"
 zpool export rpool || warn "Could not export rpool cleanly"
 
 # Mark all phases complete and remove state file (clean finish)
-mark_phase 7
+mark_phase 11
 rm -f "$STATEFILE"
 
 ###############################################################################
@@ -749,7 +916,7 @@ info ""
 info "To boot:"
 info "  1. Plug the USB SSD into any UEFI machine"
 info "  2. Enter BIOS/UEFI boot menu (usually F12, F2, or Del)"
-info "  3. Select the USB drive (shows as 'kali' or 'UEFI: EAGET')"
+info "  3. Select the USB drive (shows as 'kali' or 'UEFI: SAMSUNG')"
 info "  4. Enter your ZFS encryption passphrase when prompted"
 info ""
 info "Secure Boot:"
