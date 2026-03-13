@@ -6,3 +6,6 @@
 
 # Log files
 *.log
+
+# VM test artifacts (virtual disks, OVMF vars, TPM state)
+test/.vm/
