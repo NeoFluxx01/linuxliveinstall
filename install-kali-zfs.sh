@@ -31,8 +31,9 @@
 # Run from an Arch/CachyOS host that has ZFS loaded.
 # Requires: zfs/zpool, debootstrap, sgdisk, mkdosfs, chroot, internet
 #
-# Usage: sudo ./install-kali-zfs.sh [--resume]
-#   --resume  Skip completed phases and continue from last checkpoint
+# Usage: sudo ./install-kali-zfs.sh [--resume] [--disk=/dev/sdX]
+#   --resume         Skip completed phases and continue from last checkpoint
+#   --disk=PATH      Override disk detection (e.g. --disk=/dev/loop0 for VM testing)
 ###############################################################################
 set -euo pipefail
 
@@ -86,12 +87,30 @@ BOOT_POOL_SIZE="1G"
 ROOT_POOL_SIZE="65536M"              # 64 GiB exactly (65536 MiB)
 SWAP_SIZE="4G"
 
+# ─── Partition naming helper ───────────────────────────────────────────────
+# /dev/disk/by-id/X  → /dev/disk/by-id/X-partN
+# /dev/loopX         → /dev/loopXpN
+# /dev/sdX           → /dev/sdXN
+# /dev/nvmeXnY       → /dev/nvmeXnYpN
+part() {
+    local disk="$1" num="$2"
+    if [[ "$disk" == /dev/disk/by-* ]]; then
+        echo "${disk}-part${num}"
+    elif [[ "$disk" == /dev/loop* ]] || [[ "$disk" == /dev/nvme* ]]; then
+        echo "${disk}p${num}"
+    else
+        echo "${disk}${num}"
+    fi
+}
+
 # ─── Checkpoint / resume ───────────────────────────────────────────────────
 STATEFILE="/tmp/.install-state-kali-zfs"
 RESUME=false
+DISK_OVERRIDE=""
 for arg in "$@"; do
     case "$arg" in
         --resume) RESUME=true ;;
+        --disk=*) DISK_OVERRIDE="${arg#--disk=}" ;;
     esac
 done
 
@@ -122,8 +141,12 @@ phase() { echo -e "\n${BOLD}${CYAN}═══════════════
 # ─── Preflight checks ──────────────────────────────────────────────────────
 [[ $EUID -eq 0 ]] || error "This script must be run as root."
 
-# Resolve disk path — try WWN first (most portable), then ATA, then USB
-if [[ -e "$DISK_WWN" ]]; then
+# Resolve disk path — explicit override, or try WWN > ATA > USB
+if [[ -n "$DISK_OVERRIDE" ]]; then
+    [[ -e "$DISK_OVERRIDE" ]] || error "Disk override not found: $DISK_OVERRIDE"
+    DISK="$DISK_OVERRIDE"
+    info "Disk set via --disk= override: $DISK"
+elif [[ -e "$DISK_WWN" ]]; then
     DISK="$DISK_WWN"
     info "Disk found via WWN: $DISK"
 elif [[ -e "$DISK_ATA" ]]; then
@@ -134,11 +157,16 @@ elif [[ -e "$DISK_USB" ]]; then
     warn "Disk found via USB enclosure ID only: $DISK"
     warn "ATA/WWN passthrough not available — pool may not import if enclosure changes."
 else
-    error "Disk not found via any known identifier. Is the USB SSD plugged in?"
+    error "Disk not found via any known identifier. Is the USB SSD plugged in?\n  Tip: use --disk=/dev/sdX or --disk=/dev/loop0 for testing."
 fi
 
 # Resolve the actual block device path (e.g. /dev/sdX) for unmount operations
 DISK_DEV="$(readlink -f "$DISK")"
+
+# Compute partition device paths (naming varies: -partN, pN, or just N)
+PART_ESP="$(part "$DISK" 1)"
+PART_BOOT="$(part "$DISK" 2)"
+PART_ROOT="$(part "$DISK" 3)"
 
 # Verify ZFS module
 lsmod | grep -q '^zfs' || modprobe zfs || error "ZFS kernel module not available."
@@ -235,13 +263,17 @@ info "Creating GPT partitions..."
 sgdisk -n1:1M:+${ESP_SIZE}        -t1:EF00 -c1:"EFI System Partition" "$DISK"
 sgdisk -n2:0:+${BOOT_POOL_SIZE}   -t2:BF01 -c2:"ZFS Boot Pool"       "$DISK"
 sgdisk -n3:0:+${ROOT_POOL_SIZE}   -t3:BF00 -c3:"ZFS Root Pool"       "$DISK"
-partprobe "$DISK"
+partprobe "$DISK" 2>/dev/null || true
+# Loop devices need partx or losetup --partscan to create partition nodes
+if [[ "$DISK" == /dev/loop* ]]; then
+    partx --update "$DISK" 2>/dev/null || losetup --partscan "$DISK" 2>/dev/null || true
+fi
 sleep 2
 
 # Verify partitions appeared
-[[ -e "${DISK}-part1" ]] || error "Partition ${DISK}-part1 not found after partitioning."
-[[ -e "${DISK}-part2" ]] || error "Partition ${DISK}-part2 not found after partitioning."
-[[ -e "${DISK}-part3" ]] || error "Partition ${DISK}-part3 not found after partitioning."
+[[ -e "$PART_ESP" ]]  || error "Partition $PART_ESP not found after partitioning."
+[[ -e "$PART_BOOT" ]] || error "Partition $PART_BOOT not found after partitioning."
+[[ -e "$PART_ROOT" ]] || error "Partition $PART_ROOT not found after partitioning."
 
 info "Partition layout:"
 sgdisk -p "$(readlink -f "$DISK")"
@@ -271,7 +303,7 @@ phase "PHASE 2: Create ZFS Pools"
 
 # Format ESP
 info "Formatting ESP as FAT32..."
-mkdosfs -F 32 -s 1 -n EFI "${DISK}-part1"
+mkdosfs -F 32 -s 1 -n EFI "$PART_ESP"
 
 # Create boot pool (grub2-compatible feature set)
 info "Creating boot pool (bpool)..."
@@ -286,7 +318,7 @@ zpool create \
     -O normalization=formD \
     -O relatime=on \
     -O canmount=off -O mountpoint=/boot -R "$MNT" \
-    bpool "${DISK}-part2"
+    bpool "$PART_BOOT"
 
 # Create root pool (ZFS native encryption)
 info "Creating root pool (rpool) with native encryption..."
@@ -300,7 +332,7 @@ zpool create \
     -O normalization=formD \
     -O relatime=on \
     -O canmount=off -O mountpoint=/ -R "$MNT" \
-    rpool "${DISK}-part3"
+    rpool "$PART_ROOT"
 mark_phase 2
 fi  # end Phase 2
 
@@ -525,6 +557,7 @@ export DEBIAN_FRONTEND=noninteractive
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 export DISK="__DISK__"
+export PART_ESP="__PART_ESP__"
 
 apt_retry() {
     local attempt max_attempts=3
@@ -550,25 +583,48 @@ echo "[chroot] Setting up ESP and GRUB..."
 apt_retry install --yes dosfstools
 mkdir -p /boot/efi
 
-ESP_UUID=$(blkid -s UUID -o value ${DISK}-part1)
+ESP_UUID=$(blkid -s UUID -o value "$PART_ESP")
 # Avoid duplicate fstab entries on --resume re-runs
 grep -q "$ESP_UUID" /etc/fstab 2>/dev/null || \
     echo "UUID=${ESP_UUID} /boot/efi vfat defaults 0 0" >> /etc/fstab
 mountpoint -q /boot/efi || mount /boot/efi
 
 echo "[chroot] Installing GRUB + Secure Boot shim (Microsoft-trusted signing chain)..."
+# Kali doesn't package grub-efi-amd64-signed (version mismatch with Debian).
+# Strategy: install Kali's GRUB + Debian's signed binary extracted from the .deb.
+#
 # grub-efi-amd64         — provides grub-install and GRUB tools
-# grub-efi-amd64-signed  — pre-built GRUB binary signed with Debian's key
-#                           (trusted by the Microsoft-signed shim)
-# shim-signed             — Microsoft UEFI 3rd-party CA signed bootloader
-# sbsigntool              — verify PE/COFF Secure Boot signatures
-# mokutil                 — query/manage Machine Owner Key state
+# shim-signed            — Microsoft UEFI 3rd-party CA signed bootloader
+# sbsigntool             — verify PE/COFF Secure Boot signatures
+# mokutil                — query/manage Machine Owner Key state
 apt_retry install --yes \
     grub-efi-amd64 \
-    grub-efi-amd64-signed \
     shim-signed \
     sbsigntool \
     mokutil
+
+# Fetch Debian's signed GRUB binary (signed with Debian's key, trusted by shim)
+if [[ ! -f /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed ]]; then
+    echo "[chroot] Downloading grub-efi-amd64-signed from Debian..."
+    echo "deb http://deb.debian.org/debian trixie main" > /etc/apt/sources.list.d/debian-trixie.list
+    cat > /etc/apt/preferences.d/debian-trixie.pref <<'PINEOF'
+Package: *
+Pin: release o=Debian,n=trixie
+Pin-Priority: 100
+PINEOF
+    apt-get update -qq
+    cd /tmp
+    apt-get download grub-efi-amd64-signed
+    mkdir -p /tmp/grub-signed-extract
+    dpkg-deb --extract grub-efi-amd64-signed_*.deb /tmp/grub-signed-extract
+    mkdir -p /usr/lib/grub/x86_64-efi-signed
+    cp /tmp/grub-signed-extract/usr/lib/grub/x86_64-efi-signed/* /usr/lib/grub/x86_64-efi-signed/
+    rm -rf /tmp/grub-signed-extract /tmp/grub-efi-amd64-signed_*.deb
+    # Clean up Debian source (no longer needed)
+    rm -f /etc/apt/sources.list.d/debian-trixie.list /etc/apt/preferences.d/debian-trixie.pref
+    apt-get update -qq
+    echo "[chroot] Signed GRUB binary extracted successfully."
+fi
 
 echo "[chroot] Removing os-prober (not needed)..."
 apt-get purge --yes os-prober 2>/dev/null || true
@@ -602,6 +658,7 @@ echo "[chroot] Phase 5b complete."
 CHROOT_EOF
 
 sed -i "s|__DISK__|${DISK}|g" "$MNT/tmp/chroot-5b.sh"
+sed -i "s|__PART_ESP__|${PART_ESP}|g" "$MNT/tmp/chroot-5b.sh"
 chmod +x "$MNT/tmp/chroot-5b.sh"
 chroot "$MNT" /usr/bin/env bash /tmp/chroot-5b.sh
 rm -f "$MNT/tmp/chroot-5b.sh"
@@ -786,29 +843,56 @@ echo "  BOOTX64.EFI  = shimx64.efi  (Microsoft UEFI 3rd-party CA signed)"
 echo "  grubx64.efi  = GRUB         (Debian/Kali key signed)"
 echo "  mmx64.efi    = MOK Manager  (Microsoft UEFI 3rd-party CA signed)"
 
-# Step 3: The signed GRUB binary from grub-efi-amd64-signed has its $prefix
-# compiled to /EFI/debian. grub-install --removable wrote the search-stub
-# config at EFI/BOOT/grub/grub.cfg. Create redirect configs at all paths
-# the signed GRUB might search, so it reliably finds the real grub.cfg
-# on the ZFS boot pool regardless of which $prefix was compiled in.
-if [[ -f "$ESP_BOOT/grub/grub.cfg" ]]; then
-    echo "[chroot] Setting up GRUB config redirects for signed binary..."
-    cp "$ESP_BOOT/grub/grub.cfg" "$ESP_BOOT/grub.cfg"
-    mkdir -p /boot/efi/EFI/debian
-    cp "$ESP_BOOT/grub/grub.cfg" /boot/efi/EFI/debian/grub.cfg
+# Step 3: Copy GRUB modules to ESP for signed GRUB.
+# The signed GRUB binary from grub-efi-amd64-signed is MODULAR — unlike
+# the monolithic binary grub-install produces, it does NOT have ZFS (or
+# most other filesystem drivers) compiled in. It loads modules from its
+# $prefix, which is compiled to /EFI/debian. We must place the x86_64-efi
+# modules on the ESP so signed GRUB can insmod zfs before searching for
+# the boot pool.
+GRUB_MOD_SRC="/usr/lib/grub/x86_64-efi"
+GRUB_MOD_DST="/boot/efi/EFI/debian/x86_64-efi"
+if [[ -d "$GRUB_MOD_SRC" ]]; then
+    echo "[chroot] Copying GRUB modules to ESP for signed GRUB..."
+    mkdir -p "$GRUB_MOD_DST"
+    cp "$GRUB_MOD_SRC"/*.mod "$GRUB_MOD_DST/" 2>/dev/null || true
+    cp "$GRUB_MOD_SRC"/*.lst "$GRUB_MOD_DST/" 2>/dev/null || true
+    mod_count=$(ls -1 "$GRUB_MOD_DST"/*.mod 2>/dev/null | wc -l)
+    echo "[chroot] Copied $mod_count GRUB modules to ESP (EFI/debian/x86_64-efi/)"
+    # Verify critical ZFS modules are present
+    for m in zfs zfscrypt zfsinfo part_gpt; do
+        if [[ -f "$GRUB_MOD_DST/${m}.mod" ]]; then
+            echo "[chroot]   OK: ${m}.mod"
+        else
+            echo "[chroot]   WARNING: ${m}.mod missing — boot may fail!"
+        fi
+    done
 else
-    echo "[chroot] WARNING: grub-install did not create EFI/BOOT/grub/grub.cfg"
-    echo "[chroot] Creating manual search stub..."
-    cat > "$ESP_BOOT/grub.cfg" <<'STUBEOF'
+    echo "[chroot] WARNING: GRUB module source not found at $GRUB_MOD_SRC"
+    echo "[chroot] Signed GRUB may not be able to load ZFS modules."
+fi
+
+# Step 4: Create GRUB config redirects for signed binary.
+# The signed GRUB's $prefix is /EFI/debian. We place a grub.cfg there
+# that loads ZFS support (since it's not built in) then searches for
+# the real grub.cfg on the ZFS boot pool. The same config is placed at
+# EFI/BOOT/grub.cfg and EFI/BOOT/grub/grub.cfg as fallbacks.
+echo "[chroot] Setting up GRUB config redirects for signed binary..."
+mkdir -p /boot/efi/EFI/debian
+mkdir -p "$ESP_BOOT/grub"
+cat > /boot/efi/EFI/debian/grub.cfg <<'STUBEOF'
+# Redirect config for signed (modular) GRUB.
+# Load ZFS support first — signed GRUB doesn't have it built in.
+insmod part_gpt
+insmod zfs
 search.file /boot/grub/grub.cfg root
 set prefix=($root)/boot/grub
 configfile $prefix/grub.cfg
 STUBEOF
-    mkdir -p /boot/efi/EFI/debian
-    cp "$ESP_BOOT/grub.cfg" /boot/efi/EFI/debian/grub.cfg
-fi
+cp /boot/efi/EFI/debian/grub.cfg "$ESP_BOOT/grub.cfg"
+cp /boot/efi/EFI/debian/grub.cfg "$ESP_BOOT/grub/grub.cfg"
 
-# Step 4: Verify signatures using sbverify
+# Step 5: Verify signatures using sbverify
 if command -v sbverify &>/dev/null; then
     echo "[chroot] Verifying Secure Boot signatures on ESP binaries..."
     SB_PASS=true
@@ -830,19 +914,20 @@ else
     echo "[chroot] WARNING: sbverify not available — skipping signature verification"
 fi
 
-# Step 5: Create a dpkg hook so that future package updates to shim-signed
-# or grub-efi-amd64-signed automatically refresh the ESP binaries.
+# Step 6: Create a dpkg hook so that future package updates to shim-signed,
+# grub-efi-amd64-signed, or grub-efi-amd64 automatically refresh the ESP.
 mkdir -p /etc/apt/apt.conf.d
 cat > /etc/apt/apt.conf.d/99-secureboot-esp-sync <<'DPKGEOF'
-// After dpkg runs, if shim or signed GRUB were updated, refresh the ESP.
+// After dpkg runs, refresh signed binaries and GRUB modules on the ESP.
 DPkg::Post-Invoke {
     "if [ -f /usr/lib/shim/shimx64.efi.signed ] && [ -d /boot/efi/EFI/BOOT ]; then cp /usr/lib/shim/shimx64.efi.signed /boot/efi/EFI/BOOT/BOOTX64.EFI 2>/dev/null || true; fi";
     "if [ -f /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed ] && [ -d /boot/efi/EFI/BOOT ]; then cp /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed /boot/efi/EFI/BOOT/grubx64.efi 2>/dev/null || true; fi";
     "if [ -f /usr/lib/shim/mmx64.efi.signed ] && [ -d /boot/efi/EFI/BOOT ]; then cp /usr/lib/shim/mmx64.efi.signed /boot/efi/EFI/BOOT/mmx64.efi 2>/dev/null || true; fi";
+    "if [ -d /usr/lib/grub/x86_64-efi ] && [ -d /boot/efi/EFI/debian/x86_64-efi ]; then cp /usr/lib/grub/x86_64-efi/*.mod /boot/efi/EFI/debian/x86_64-efi/ 2>/dev/null || true; cp /usr/lib/grub/x86_64-efi/*.lst /boot/efi/EFI/debian/x86_64-efi/ 2>/dev/null || true; fi";
 };
 DPKGEOF
 echo "[chroot] Installed dpkg hook: /etc/apt/apt.conf.d/99-secureboot-esp-sync"
-echo "  (auto-refreshes signed binaries on ESP when packages are updated)"
+echo "  (auto-refreshes signed binaries + GRUB modules on ESP when packages are updated)"
 
 update-grub
 

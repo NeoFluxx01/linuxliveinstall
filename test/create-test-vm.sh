@@ -176,14 +176,8 @@ cmd_install() {
     LOOP_DEV=$(losetup --find --show "$VDISK")
     info "Loop device: $LOOP_DEV"
 
-    # Create a temporary by-id symlink so the installer's disk detection works
-    # (the installer expects /dev/disk/by-id/... paths)
-    FAKE_ID="/dev/disk/by-id/test-virtual-disk-128GB"
-    ln -sf "$LOOP_DEV" "$FAKE_ID" 2>/dev/null || true
-
     cleanup_loop() {
         info "Cleaning up loop device..."
-        rm -f "$FAKE_ID" 2>/dev/null || true
         losetup -d "$LOOP_DEV" 2>/dev/null || true
     }
     trap cleanup_loop EXIT
@@ -209,22 +203,14 @@ cmd_install() {
 
     info ""
     info "Installer:   $installer"
-    info "Target disk: $FAKE_ID -> $LOOP_DEV -> $VDISK"
+    info "Target disk: $LOOP_DEV -> $VDISK"
     info ""
-    warn "The installer's disk detection will need to be pointed at:"
-    warn "  $FAKE_ID"
-    warn ""
-    warn "You can either:"
-    warn "  1. Edit the DISK_* variables in the installer temporarily"
-    warn "  2. Or use the modular installer with --disk=$FAKE_ID"
+    info "Launching installer with --disk=$LOOP_DEV ..."
     info ""
-    info "Loop device is ready. You can now run the installer manually:"
-    info "  sudo bash $installer"
-    info ""
-    info "Or press Enter to launch it automatically..."
+    info "Press Enter to start, or Ctrl+C to cancel..."
     read -rp ""
 
-    bash "$installer"
+    bash "$installer" --disk="$LOOP_DEV"
 }
 
 cmd_boot() {

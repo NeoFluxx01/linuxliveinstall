@@ -138,3 +138,8 @@ Scripts use WWN (World Wide Name) as the primary disk identifier — burned into
 ## License
 
 MIT
+
+## Documentation
+
+- [ARCHITECTURE.md](ARCHITECTURE.md) — Design decisions, trade-offs, and technical "why" behind every major choice
+- [KNOWN_ISSUES.md](KNOWN_ISSUES.md) — Active bugs, workarounds, and resolved issues
