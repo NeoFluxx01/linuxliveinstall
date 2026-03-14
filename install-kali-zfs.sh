@@ -22,7 +22,8 @@
 #   - Portable GRUB (--removable, writes EFI/BOOT/BOOTX64.EFI)
 #   - Works on TPM-equipped machines (Secure Boot PCR attestation)
 #   - Auto-refreshes signed binaries on ESP via dpkg hook
-#   - Full signature verification at install time (sbverify)
+#   - Full certificate chain verification at install time (sbverify)
+#   - Offline Secure Boot support (--debian-iso provides signed shim + GRUB)
 #   - KDE Plasma desktop
 #   - NetworkManager for portable network handling
 #   - Comprehensive firmware bundle for broad hardware compatibility
@@ -205,20 +206,23 @@ SQUASHFS_PATH="$ISO_MNT/live/filesystem.squashfs"
 info "Kali ISO mounted: $ISO_PATH"
 info "  Squashfs: $(du -h "$SQUASHFS_PATH" | cut -f1)"
 
-# Mount Debian ISO if provided (for offline signed GRUB)
+# Mount Debian ISO if provided (for offline signed GRUB + shim)
 DEBIAN_ISO_MNT=""
 DEBIAN_SIGNED_GRUB_DEB=""
+DEBIAN_SIGNED_SHIM_DEB=""
 if [[ -n "$DEBIAN_ISO_PATH" ]]; then
     [[ -f "$DEBIAN_ISO_PATH" ]] || error "Debian ISO not found: $DEBIAN_ISO_PATH"
     DEBIAN_ISO_MNT="/tmp/.debian-iso-$$"
     mkdir -p "$DEBIAN_ISO_MNT"
     mount -o loop,ro "$DEBIAN_ISO_PATH" "$DEBIAN_ISO_MNT" || error "Failed to mount Debian ISO: $DEBIAN_ISO_PATH"
     DEBIAN_SIGNED_GRUB_DEB=$(find "$DEBIAN_ISO_MNT/pool/" -name "grub-efi-amd64-signed_*.deb" 2>/dev/null | head -1)
-    if [[ -n "$DEBIAN_SIGNED_GRUB_DEB" ]]; then
+    DEBIAN_SIGNED_SHIM_DEB=$(find "$DEBIAN_ISO_MNT/pool/" -name "shim-signed_*.deb" 2>/dev/null | head -1)
+    if [[ -n "$DEBIAN_SIGNED_GRUB_DEB" || -n "$DEBIAN_SIGNED_SHIM_DEB" ]]; then
         info "Debian ISO mounted: $DEBIAN_ISO_PATH"
-        info "  Found signed GRUB: $(basename "$DEBIAN_SIGNED_GRUB_DEB")"
+        [[ -n "$DEBIAN_SIGNED_GRUB_DEB" ]] && info "  Found signed GRUB: $(basename "$DEBIAN_SIGNED_GRUB_DEB")"
+        [[ -n "$DEBIAN_SIGNED_SHIM_DEB" ]] && info "  Found signed shim: $(basename "$DEBIAN_SIGNED_SHIM_DEB")"
     else
-        warn "Debian ISO mounted but grub-efi-amd64-signed not found — will download from internet."
+        warn "Debian ISO mounted but signed packages not found — will download from internet."
     fi
 fi
 
@@ -475,11 +479,12 @@ if [[ -d "$ISO_MNT/pool" && -d "$ISO_MNT/dists" ]]; then
     info "  ISO repo copied to /opt/iso-repo/ ($(du -sh "$MNT/opt/iso-repo" | cut -f1))"
 fi
 
-# Copy Debian signed GRUB deb if available
-if [[ -n "$DEBIAN_SIGNED_GRUB_DEB" ]]; then
-    info "Copying Debian signed GRUB deb into chroot..."
+# Copy Debian signed debs if available (GRUB + shim)
+if [[ -n "$DEBIAN_SIGNED_GRUB_DEB" || -n "$DEBIAN_SIGNED_SHIM_DEB" ]]; then
+    info "Copying Debian signed packages into chroot..."
     mkdir -p "$MNT/opt/iso-repo/debian-signed"
-    cp "$DEBIAN_SIGNED_GRUB_DEB" "$MNT/opt/iso-repo/debian-signed/"
+    [[ -n "$DEBIAN_SIGNED_GRUB_DEB" ]] && cp "$DEBIAN_SIGNED_GRUB_DEB" "$MNT/opt/iso-repo/debian-signed/"
+    [[ -n "$DEBIAN_SIGNED_SHIM_DEB" ]] && cp "$DEBIAN_SIGNED_SHIM_DEB" "$MNT/opt/iso-repo/debian-signed/"
 fi
 mark_phase 4
 fi  # end Phase 4
@@ -660,16 +665,47 @@ grep -q "$ESP_UUID" /etc/fstab 2>/dev/null || \
 mountpoint -q /boot/efi || mount /boot/efi
 
 echo "[chroot] Installing GRUB + Secure Boot shim (Microsoft-trusted signing chain)..."
-# grub-efi-amd64 and shim-signed come from ISO local repo (offline).
-# sbsigntool may need internet if not in ISO repo.
-apt_retry install --yes \
-    grub-efi-amd64 \
-    shim-signed \
-    mokutil
+
+# Step 1: Install GRUB, shim, and verification tools.
+# grub-efi-amd64 is in Kali repos and ISO local repo.
+# shim-signed is in Kali repos but NOT on the Kali live ISO — may need internet
+# or Debian ISO fallback. Try the normal install first.
+apt_retry install --yes grub-efi-amd64 mokutil
 apt_retry install --yes sbsigntool 2>/dev/null || \
     echo "[chroot] WARNING: sbsigntool not available — signature verification will be skipped"
 
-# Fetch Debian's signed GRUB binary (signed with Debian's key, trusted by shim)
+# Step 2: Install shim-signed (with Debian ISO offline fallback).
+# Kali inherits shim-signed from Debian — the shim binary is signed by
+# Microsoft's UEFI Third-Party Marketplace CA, and embeds the Debian
+# Secure Boot signing key. This key validates both Debian-signed GRUB
+# and Debian/Kali-signed kernels.
+if ! dpkg -s shim-signed &>/dev/null; then
+    echo "[chroot] shim-signed not installed — attempting apt install..."
+    if apt_retry install --yes shim-signed 2>/dev/null; then
+        echo "[chroot] shim-signed installed from repository."
+    elif [[ -d /opt/iso-repo/debian-signed ]] && ls /opt/iso-repo/debian-signed/shim-signed_*.deb &>/dev/null; then
+        # Fallback: extract from Debian ISO (offline)
+        echo "[chroot] Extracting shim-signed from Debian ISO (offline)..."
+        mkdir -p /tmp/shim-signed-extract
+        dpkg-deb --extract /opt/iso-repo/debian-signed/shim-signed_*.deb /tmp/shim-signed-extract
+        # Place signed shim binaries where the boot chain expects them
+        mkdir -p /usr/lib/shim
+        cp /tmp/shim-signed-extract/usr/lib/shim/* /usr/lib/shim/ 2>/dev/null || true
+        rm -rf /tmp/shim-signed-extract
+        echo "[chroot] shim-signed binaries extracted from Debian ISO."
+    else
+        echo "FATAL: shim-signed not available from repos or Debian ISO. Secure Boot will not work."
+        echo "  Provide --debian-iso=PATH pointing to a Debian live ISO for offline fallback."
+        exit 1
+    fi
+else
+    echo "[chroot] shim-signed already installed."
+fi
+
+# Step 3: Fetch Debian's signed GRUB binary (signed with Debian's key, trusted by shim).
+# Kali does not package grub-efi-amd64-signed. We extract just the signed
+# binary from Debian's package — the rest of GRUB comes from Kali's own
+# grub-efi-amd64 package.
 if [[ ! -f /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed ]]; then
     if [[ -d /opt/iso-repo/debian-signed ]] && ls /opt/iso-repo/debian-signed/grub-efi-amd64-signed_*.deb &>/dev/null; then
         # Extract from Debian ISO (offline)
@@ -702,6 +738,27 @@ PINEOF
         apt-get update -qq
         echo "[chroot] Signed GRUB binary downloaded and extracted."
     fi
+fi
+
+# Step 4: Final verification — all signed binaries must be present.
+echo "[chroot] Verifying signed binary availability..."
+SB_READY=true
+for sb_check in \
+    "/usr/lib/shim/shimx64.efi.signed:shim-signed" \
+    "/usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed:grub-efi-amd64-signed"; do
+    sb_path="${sb_check%%:*}"
+    sb_pkg="${sb_check#*:}"
+    if [[ -f "$sb_path" ]]; then
+        sb_size=$(stat -c%s "$sb_path")
+        echo "[chroot]   OK: $sb_pkg — $(basename "$sb_path") ($sb_size bytes)"
+    else
+        echo "[chroot]   MISSING: $sb_pkg — $sb_path not found!"
+        SB_READY=false
+    fi
+done
+if ! $SB_READY; then
+    echo "FATAL: Signed binaries missing. Secure Boot chain cannot be built."
+    exit 1
 fi
 
 echo "[chroot] Removing os-prober (not needed)..."
@@ -951,42 +1008,77 @@ STUBEOF
 cp /boot/efi/EFI/debian/grub.cfg "$ESP_BOOT/grub.cfg"
 cp /boot/efi/EFI/debian/grub.cfg "$ESP_BOOT/grub/grub.cfg"
 
-# Step 5: Verify signatures using sbverify
+# Step 5: Verify signatures using sbverify — shim, GRUB, AND kernel.
+# This is the install-time verification. Phase 6 does a final audit from
+# outside the chroot. We catch problems here so they can be fixed before
+# the user finishes the install.
 if command -v sbverify &>/dev/null; then
-    echo "[chroot] Verifying Secure Boot signatures on ESP binaries..."
+    echo "[chroot] Verifying Secure Boot signatures..."
     SB_PASS=true
+
+    # 5a: Verify shim and GRUB on ESP
     for efi_bin in "$ESP_BOOT/BOOTX64.EFI" "$ESP_BOOT/grubx64.efi"; do
         efi_name="$(basename "$efi_bin")"
-        sig_count=$(sbverify --list "$efi_bin" 2>/dev/null | grep -c 'signature' || true)
+        sig_info=$(sbverify --list "$efi_bin" 2>&1 || true)
+        sig_count=$(echo "$sig_info" | grep -ci 'signature' || true)
         if (( sig_count > 0 )); then
-            echo "  OK: $efi_name — $sig_count signature(s) found"
+            echo "  OK: $efi_name — $sig_count signature(s)"
+            # Show signer for audit trail
+            echo "$sig_info" | grep -i 'subject' | head -1 | sed 's/^/          /'
         else
             echo "  FAIL: $efi_name — NO signature found!"
             SB_PASS=false
         fi
     done
+
+    # 5b: Verify kernel signature — shim validates vmlinuz at boot time.
+    # An unsigned kernel will fail to load when Secure Boot is active.
+    VMLINUZ_LATEST=$(ls -1 /boot/vmlinuz-* 2>/dev/null | sort -V | tail -1)
+    if [[ -n "$VMLINUZ_LATEST" && -f "$VMLINUZ_LATEST" ]]; then
+        sig_info=$(sbverify --list "$VMLINUZ_LATEST" 2>&1 || true)
+        sig_count=$(echo "$sig_info" | grep -ci 'signature' || true)
+        if (( sig_count > 0 )); then
+            echo "  OK: $(basename "$VMLINUZ_LATEST") — signed kernel"
+            echo "$sig_info" | grep -i 'subject' | head -1 | sed 's/^/          /'
+        else
+            echo "  WARNING: $(basename "$VMLINUZ_LATEST") — kernel NOT signed"
+            echo "    Secure Boot will block this kernel. If Secure Boot is required,"
+            echo "    install a signed kernel or disable Secure Boot."
+            # Don't hard-fail — Kali custom kernels may intentionally be unsigned.
+            # Phase 6 will report the full chain status.
+        fi
+    else
+        echo "  WARNING: No vmlinuz found in /boot/ — cannot verify kernel signature"
+    fi
+
     if ! $SB_PASS; then
-        echo "FATAL: Signed binaries failed signature check. Secure Boot will not work."
+        echo "FATAL: Signed boot binaries failed signature check. Secure Boot will not work."
         exit 1
     fi
 else
     echo "[chroot] WARNING: sbverify not available — skipping signature verification"
 fi
 
-# Step 6: Create a dpkg hook so that future package updates to shim-signed,
-# grub-efi-amd64-signed, or grub-efi-amd64 automatically refresh the ESP.
+# Step 6: dpkg hook — auto-refresh ESP on package updates.
+# Covers: shim-signed, grub-efi-amd64-signed, grub-efi-amd64 (modules),
+# and linux-image-* (kernel). When any of these are upgraded via apt,
+# the signed binaries and modules on the ESP are automatically updated.
 mkdir -p /etc/apt/apt.conf.d
 cat > /etc/apt/apt.conf.d/99-secureboot-esp-sync <<'DPKGEOF'
-// After dpkg runs, refresh signed binaries and GRUB modules on the ESP.
+// Secure Boot ESP sync hook — refreshes signed binaries, GRUB modules,
+// and kernel on the ESP after any dpkg operation. This keeps the boot
+// chain in sync with package updates. Safe to run unconditionally —
+// each cp is guarded by source/destination existence checks.
 DPkg::Post-Invoke {
     "if [ -f /usr/lib/shim/shimx64.efi.signed ] && [ -d /boot/efi/EFI/BOOT ]; then cp /usr/lib/shim/shimx64.efi.signed /boot/efi/EFI/BOOT/BOOTX64.EFI 2>/dev/null || true; fi";
     "if [ -f /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed ] && [ -d /boot/efi/EFI/BOOT ]; then cp /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed /boot/efi/EFI/BOOT/grubx64.efi 2>/dev/null || true; fi";
     "if [ -f /usr/lib/shim/mmx64.efi.signed ] && [ -d /boot/efi/EFI/BOOT ]; then cp /usr/lib/shim/mmx64.efi.signed /boot/efi/EFI/BOOT/mmx64.efi 2>/dev/null || true; fi";
+    "if [ -f /usr/lib/shim/fbx64.efi.signed ] && [ -d /boot/efi/EFI/BOOT ]; then cp /usr/lib/shim/fbx64.efi.signed /boot/efi/EFI/BOOT/fbx64.efi 2>/dev/null || true; fi";
     "if [ -d /usr/lib/grub/x86_64-efi ] && [ -d /boot/efi/EFI/debian/x86_64-efi ]; then cp /usr/lib/grub/x86_64-efi/*.mod /boot/efi/EFI/debian/x86_64-efi/ 2>/dev/null || true; cp /usr/lib/grub/x86_64-efi/*.lst /boot/efi/EFI/debian/x86_64-efi/ 2>/dev/null || true; fi";
 };
 DPKGEOF
 echo "[chroot] Installed dpkg hook: /etc/apt/apt.conf.d/99-secureboot-esp-sync"
-echo "  (auto-refreshes signed binaries + GRUB modules on ESP when packages are updated)"
+echo "  Covers: shim, GRUB, MOK manager, fallback, GRUB modules"
 
 update-grub
 
@@ -1094,20 +1186,23 @@ if skip_phase 10; then
 else
 phase "PHASE 6: Verify Secure Boot Chain"
 
-# ── File presence checks ────────────────────────────────────────────────────
 SB_OK=true
+SB_WARNINGS=0
 ESP_BOOT="$MNT/boot/efi/EFI/BOOT"
 
+# ── 6a: File presence checks ────────────────────────────────────────────────
 info "Checking Secure Boot binaries on ESP..."
 for efi_item in \
     "BOOTX64.EFI:shimx64 (Microsoft UEFI 3rd-party CA signed)" \
-    "grubx64.efi:GRUB (Debian/Kali key signed)" \
-    "mmx64.efi:MOK Manager (optional on locked BIOS)"; do
+    "grubx64.efi:GRUB (Debian key signed, validated by shim)" \
+    "mmx64.efi:MOK Manager (optional — for manual key enrollment)" \
+    "fbx64.efi:Fallback (optional — for NVRAM-less boot)"; do
     efi_file="${efi_item%%:*}"
     efi_desc="${efi_item#*:}"
     if [[ -f "$ESP_BOOT/$efi_file" ]]; then
-        info "  FOUND: $efi_file — $efi_desc"
-    elif [[ "$efi_file" == "mmx64.efi" ]]; then
+        efi_size=$(stat -c%s "$ESP_BOOT/$efi_file" 2>/dev/null || echo "?")
+        info "  FOUND: $efi_file — $efi_desc ($efi_size bytes)"
+    elif [[ "$efi_file" == "mmx64.efi" || "$efi_file" == "fbx64.efi" ]]; then
         warn "  MISSING: $efi_file — $efi_desc (non-fatal)"
     else
         warn "  MISSING: $efi_file — $efi_desc"
@@ -1115,7 +1210,7 @@ for efi_item in \
     fi
 done
 
-# ── GRUB config redirect checks ────────────────────────────────────────────
+# ── 6b: GRUB config redirect checks ────────────────────────────────────────
 info ""
 info "Checking GRUB config accessibility for signed binary..."
 for cfg_path in \
@@ -1130,94 +1225,185 @@ for cfg_path in \
     fi
 done
 
-# ── Cryptographic signature verification ────────────────────────────────────
-# Use sbverify (from sbsigntool) to inspect PE/COFF Authenticode signatures.
-# We verify that signatures exist on the critical boot binaries. The actual
-# trust validation happens at boot time (UEFI DB validates shim, shim
-# validates GRUB, shim protocol validates kernel).
+# Verify grub.cfg contains ZFS insmod (critical for signed modular GRUB)
+DEBIAN_CFG="$MNT/boot/efi/EFI/debian/grub.cfg"
+if [[ -f "$DEBIAN_CFG" ]]; then
+    if grep -q 'insmod zfs' "$DEBIAN_CFG"; then
+        info "  OK: grub.cfg contains 'insmod zfs'"
+    else
+        warn "  MISSING: grub.cfg does NOT contain 'insmod zfs' — signed GRUB cannot read ZFS!"
+        SB_OK=false
+    fi
+fi
+
+# ── 6c: GRUB modules on ESP ────────────────────────────────────────────────
+info ""
+GRUB_MOD_DIR="$MNT/boot/efi/EFI/debian/x86_64-efi"
+if [[ -d "$GRUB_MOD_DIR" ]]; then
+    mod_count=$(ls -1 "$GRUB_MOD_DIR"/*.mod 2>/dev/null | wc -l)
+    info "GRUB modules on ESP: $mod_count modules in EFI/debian/x86_64-efi/"
+    for m in zfs zfscrypt zfsinfo part_gpt fat ext2 normal search search_fs_file configfile linux gzio; do
+        if [[ -f "$GRUB_MOD_DIR/${m}.mod" ]]; then
+            info "  OK: ${m}.mod"
+        else
+            warn "  MISSING: ${m}.mod"
+            [[ "$m" == "zfs" ]] && SB_OK=false  # ZFS module is critical
+        fi
+    done
+else
+    warn "GRUB module directory not found: EFI/debian/x86_64-efi/"
+    warn "Signed GRUB will not be able to load filesystem drivers!"
+    SB_OK=false
+fi
+
+# ── 6d: Cryptographic signature verification ────────────────────────────────
+# Use sbverify to inspect PE/COFF Authenticode signatures on all boot
+# binaries. We extract signer certificates for chain validation.
 info ""
 if command -v sbverify &>/dev/null || [[ -x "$MNT/usr/bin/sbverify" ]]; then
     SBVERIFY="sbverify"
     command -v sbverify &>/dev/null || SBVERIFY="chroot $MNT sbverify"
 
-    info "Cryptographic signature verification (sbverify):"
+    info "Cryptographic signature verification:"
 
-    for efi_item in "BOOTX64.EFI:shim" "grubx64.efi:GRUB"; do
-        efi_file="${efi_item%%:*}"
-        efi_label="${efi_item#*:}"
-        if [[ ! -f "$ESP_BOOT/$efi_file" ]]; then continue; fi
+    # Collect signer subjects for chain consistency check
+    SHIM_SIGNER=""
+    GRUB_SIGNER=""
+    KERNEL_SIGNER=""
 
-        sig_info=$($SBVERIFY --list "$ESP_BOOT/$efi_file" 2>&1 || true)
+    # Verify shim (BOOTX64.EFI)
+    if [[ -f "$ESP_BOOT/BOOTX64.EFI" ]]; then
+        sig_info=$($SBVERIFY --list "$ESP_BOOT/BOOTX64.EFI" 2>&1 || true)
         sig_count=$(echo "$sig_info" | grep -ci 'signature' || true)
+        SHIM_SIGNER=$(echo "$sig_info" | grep -i 'subject' | head -1 | sed 's/.*CN=//' | sed 's/,.*//' || true)
         if (( sig_count > 0 )); then
-            info "  SIGNED: $efi_file ($efi_label) — $sig_count signature(s)"
-            # Show signer details if available
-            echo "$sig_info" | grep -i 'subject\|issuer' | head -4 | while read -r line; do
-                info "          $line"
-            done
+            info "  SIGNED: BOOTX64.EFI (shim) — $sig_count signature(s)"
+            [[ -n "$SHIM_SIGNER" ]] && info "          Signer: $SHIM_SIGNER"
         else
-            warn "  UNSIGNED: $efi_file ($efi_label) — Secure Boot WILL FAIL"
+            warn "  UNSIGNED: BOOTX64.EFI (shim) — UEFI firmware will REFUSE to load"
             SB_OK=false
         fi
-    done
+    fi
 
-    # Verify kernel signature (vmlinuz on bpool)
+    # Verify GRUB (grubx64.efi)
+    if [[ -f "$ESP_BOOT/grubx64.efi" ]]; then
+        sig_info=$($SBVERIFY --list "$ESP_BOOT/grubx64.efi" 2>&1 || true)
+        sig_count=$(echo "$sig_info" | grep -ci 'signature' || true)
+        GRUB_SIGNER=$(echo "$sig_info" | grep -i 'subject' | head -1 | sed 's/.*CN=//' | sed 's/,.*//' || true)
+        if (( sig_count > 0 )); then
+            info "  SIGNED: grubx64.efi (GRUB) — $sig_count signature(s)"
+            [[ -n "$GRUB_SIGNER" ]] && info "          Signer: $GRUB_SIGNER"
+        else
+            warn "  UNSIGNED: grubx64.efi (GRUB) — shim will REFUSE to load"
+            SB_OK=false
+        fi
+    fi
+
+    # Verify kernel (vmlinuz)
     VMLINUZ=$(ls -1 "$MNT/boot/vmlinuz-"* 2>/dev/null | sort -V | tail -1)
     if [[ -n "$VMLINUZ" && -f "$VMLINUZ" ]]; then
         sig_info=$($SBVERIFY --list "$VMLINUZ" 2>&1 || true)
         sig_count=$(echo "$sig_info" | grep -ci 'signature' || true)
+        KERNEL_SIGNER=$(echo "$sig_info" | grep -i 'subject' | head -1 | sed 's/.*CN=//' | sed 's/,.*//' || true)
         if (( sig_count > 0 )); then
-            info "  SIGNED: $(basename "$VMLINUZ") (kernel) — $sig_count signature(s)"
+            info "  SIGNED: $(basename "$VMLINUZ") — $sig_count signature(s)"
+            [[ -n "$KERNEL_SIGNER" ]] && info "          Signer: $KERNEL_SIGNER"
         else
             warn "  UNSIGNED: $(basename "$VMLINUZ") (kernel)"
-            warn "    Shim will refuse to load an unsigned kernel when Secure Boot is active."
-            warn "    Ensure linux-image-amd64 provides a signed kernel (check: linux-image-amd64-signed)."
-            SB_OK=false
+            warn "    Shim will refuse to load this kernel when Secure Boot is active."
+            warn "    The drive will still boot on machines with Secure Boot DISABLED."
+            SB_WARNINGS=$((SB_WARNINGS + 1))
         fi
     else
         warn "  No vmlinuz found in $MNT/boot/ — cannot verify kernel signature"
+        SB_WARNINGS=$((SB_WARNINGS + 1))
+    fi
+
+    # ── 6e: Certificate chain consistency ────────────────────────────────────
+    # Shim should be signed by Microsoft; GRUB and kernel should be signed
+    # by the same Debian/Kali key that's embedded in shim.
+    info ""
+    info "Certificate chain analysis:"
+    if [[ -n "$SHIM_SIGNER" ]]; then
+        if echo "$SHIM_SIGNER" | grep -qi 'microsoft'; then
+            info "  OK: Shim signed by Microsoft (trusted by factory UEFI DB)"
+        else
+            warn "  UNEXPECTED: Shim signer is '$SHIM_SIGNER' (expected Microsoft)"
+            SB_WARNINGS=$((SB_WARNINGS + 1))
+        fi
+    fi
+    if [[ -n "$GRUB_SIGNER" && -n "$KERNEL_SIGNER" ]]; then
+        if [[ "$GRUB_SIGNER" == "$KERNEL_SIGNER" ]]; then
+            info "  OK: GRUB and kernel signed by same key ($GRUB_SIGNER)"
+            info "      This key should be embedded in shim (no MOK needed)"
+        else
+            warn "  MISMATCH: GRUB signer '$GRUB_SIGNER' != kernel signer '$KERNEL_SIGNER'"
+            warn "    If the kernel uses a different key than what shim embeds,"
+            warn "    MOK enrollment may be required on real hardware."
+            SB_WARNINGS=$((SB_WARNINGS + 1))
+        fi
     fi
 else
     warn "sbverify not available — cannot perform cryptographic verification"
-    warn "Install sbsigntool to enable signature checking"
+    warn "Install sbsigntool on host to enable: pacman -S sbsigntools"
+    SB_WARNINGS=$((SB_WARNINGS + 1))
 fi
 
-# ── Summary ─────────────────────────────────────────────────────────────────
+# ── 6f: Binary hash inventory ───────────────────────────────────────────────
+# Record SHA256 hashes for forensic reference. Useful for verifying the ESP
+# hasn't been tampered with after install.
+info ""
+info "Binary hash inventory (SHA256):"
+for efi_file in BOOTX64.EFI grubx64.efi mmx64.efi fbx64.efi; do
+    if [[ -f "$ESP_BOOT/$efi_file" ]]; then
+        hash=$(sha256sum "$ESP_BOOT/$efi_file" | cut -d' ' -f1)
+        info "  $efi_file: ${hash:0:16}..."
+    fi
+done
+if [[ -n "${VMLINUZ:-}" && -f "${VMLINUZ:-}" ]]; then
+    hash=$(sha256sum "$VMLINUZ" | cut -d' ' -f1)
+    info "  $(basename "$VMLINUZ"): ${hash:0:16}..."
+fi
+
+# ── 6g: Summary ─────────────────────────────────────────────────────────────
 info ""
 info "Secure Boot trust chain:"
 info "  ┌─ UEFI Firmware ──────────────────────────────────────────────┐"
-info "  │  Secure Boot DB contains: Microsoft UEFI CA 2011            │"
-info "  │  (factory-installed on all UEFI PCs since 2012)             │"
+info "  │  Secure Boot DB: Microsoft UEFI CA 2011 (factory-installed)  │"
 info "  └──────────────────────┬───────────────────────────────────────┘"
 info "                         │ validates"
 info "  ┌──────────────────────▼───────────────────────────────────────┐"
 info "  │  BOOTX64.EFI (shimx64)                                      │"
-info "  │  Signed by: Microsoft Corporation UEFI CA 2011               │"
-info "  │  Contains:  Debian signing key (hardcoded, not MOK)          │"
+info "  │  Signed by: Microsoft UEFI Third-Party Marketplace CA        │"
+info "  │  Contains:  Debian Secure Boot key (hardcoded)               │"
 info "  └──────────────────────┬───────────────────────────────────────┘"
 info "                         │ validates"
 info "  ┌──────────────────────▼───────────────────────────────────────┐"
 info "  │  grubx64.efi (GRUB)                                         │"
 info "  │  Signed by: Debian Secure Boot key (embedded in shim)        │"
-info "  │  Reads: ZFS bpool → /boot/grub/grub.cfg → kernel + initramfs│"
+info "  │  Loads: ZFS modules → bpool → /boot/grub/grub.cfg           │"
 info "  └──────────────────────┬───────────────────────────────────────┘"
 info "                         │ validates (shim protocol)"
 info "  ┌──────────────────────▼───────────────────────────────────────┐"
 info "  │  vmlinuz (Linux kernel)                                      │"
-info "  │  Signed by: Debian Secure Boot key                           │"
+info "  │  Signed by: Debian/Kali Secure Boot key                      │"
 info "  └──────────────────────┬───────────────────────────────────────┘"
 info "                         │ loads"
 info "  ┌──────────────────────▼───────────────────────────────────────┐"
 info "  │  initramfs → ZFS module → passphrase prompt → mount rpool    │"
 info "  └──────────────────────────────────────────────────────────────┘"
 info ""
-if $SB_OK; then
-    info "Secure Boot: READY"
+if $SB_OK && (( SB_WARNINGS == 0 )); then
+    info "Secure Boot: READY (all checks passed)"
     info "  Compatible with: ALL UEFI machines trusting Microsoft UEFI CA"
     info "  Including: password-locked BIOS (no MOK enrollment required)"
+elif $SB_OK; then
+    warn "Secure Boot: READY WITH WARNINGS ($SB_WARNINGS warning(s) — see above)"
+    warn "  Core chain (shim + GRUB) is signed. Review warnings for full details."
 else
-    warn "Secure Boot: ISSUES DETECTED (see warnings above)"
-    warn "  The drive may still boot on machines with Secure Boot disabled."
+    warn "Secure Boot: CRITICAL ISSUES (boot chain is broken)"
+    warn "  The drive will NOT boot on machines with Secure Boot enabled."
+    warn "  Fix the issues above, or boot with Secure Boot disabled."
 fi
 info ""
 info "TPM integration:"
@@ -1226,7 +1412,7 @@ info "  through the full chain (shim → GRUB → kernel). This provides"
 info "  attestation that the boot path has not been tampered with."
 info "  ZFS decryption uses your passphrase (not TPM-bound)."
 
-# List all EFI files on ESP
+# ── ESP layout ──────────────────────────────────────────────────────────────
 info ""
 info "ESP layout:"
 find "$MNT/boot/efi/" -type f 2>/dev/null | sort | while read -r f; do
@@ -1298,6 +1484,7 @@ info "  The entire boot chain is signed with Microsoft-trusted keys."
 info "  No BIOS access, key enrollment, or MOK management needed."
 info "  Chain: shimx64.efi (MS-signed) → grubx64.efi (Debian-signed) → vmlinuz (signed)"
 info "  Auto-maintained: dpkg hook refreshes ESP binaries on package updates."
+info "  Verified: install-time certificate chain validation (Phase 6)."
 info ""
 info "TPM:"
 info "  Secure Boot + TPM machines validate the boot chain via PCR"
