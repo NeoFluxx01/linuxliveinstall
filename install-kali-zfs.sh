@@ -29,9 +29,11 @@
 #   - hostid set in initramfs for portable pool imports
 #
 # Run from an Arch/CachyOS host that has ZFS loaded.
-# Requires: zfs/zpool, debootstrap, sgdisk, mkdosfs, chroot, internet
+# Requires: zfs/zpool, unsquashfs, sgdisk, mkdosfs, chroot, internet (for ZFS packages)
 #
-# Usage: sudo ./install-kali-zfs.sh [--resume] [--disk=/dev/sdX]
+# Usage: sudo ./install-kali-zfs.sh --iso=PATH [--debian-iso=PATH] [--resume] [--disk=/dev/sdX]
+#   --iso=PATH       Path to Kali Linux live ISO (required)
+#   --debian-iso=PATH  Path to Debian live ISO (optional, for offline signed GRUB)
 #   --resume         Skip completed phases and continue from last checkpoint
 #   --disk=PATH      Override disk detection (e.g. --disk=/dev/loop0 for VM testing)
 ###############################################################################
@@ -107,10 +109,14 @@ part() {
 STATEFILE="/tmp/.install-state-kali-zfs"
 RESUME=false
 DISK_OVERRIDE=""
+ISO_PATH=""
+DEBIAN_ISO_PATH=""
 for arg in "$@"; do
     case "$arg" in
         --resume) RESUME=true ;;
         --disk=*) DISK_OVERRIDE="${arg#--disk=}" ;;
+        --iso=*) ISO_PATH="${arg#--iso=}" ;;
+        --debian-iso=*) DEBIAN_ISO_PATH="${arg#--debian-iso=}" ;;
     esac
 done
 
@@ -176,16 +182,49 @@ if ! command -v sgdisk &>/dev/null; then
     info "sgdisk not found — installing gptfdisk via pacman..."
     pacman -S --noconfirm gptfdisk || error "Failed to install gptfdisk (provides sgdisk)"
 fi
-if ! command -v debootstrap &>/dev/null; then
-    info "debootstrap not found — installing via pacman..."
-    pacman -S --noconfirm debootstrap || error "Failed to install debootstrap"
+if ! command -v unsquashfs &>/dev/null; then
+    info "unsquashfs not found — installing squashfs-tools via pacman..."
+    pacman -S --noconfirm squashfs-tools || error "Failed to install squashfs-tools (provides unsquashfs)"
 fi
 
-for cmd in sgdisk zpool zfs debootstrap mkdosfs chroot blkdiscard partprobe; do
+for cmd in sgdisk zpool zfs unsquashfs mkdosfs chroot blkdiscard partprobe; do
     command -v "$cmd" &>/dev/null || error "Missing required command: $cmd"
 done
 
+# ─── ISO validation ─────────────────────────────────────────────────────────
+[[ -n "$ISO_PATH" ]] || error "--iso=PATH is required. Point it at a Kali Linux live ISO."
+[[ -f "$ISO_PATH" ]] || error "ISO not found: $ISO_PATH"
+
+ISO_MNT="/tmp/.kali-iso-$$"
+mkdir -p "$ISO_MNT"
+mount -o loop,ro "$ISO_PATH" "$ISO_MNT" || error "Failed to mount ISO: $ISO_PATH"
+
+# Verify it's a Kali live ISO with a squashfs
+SQUASHFS_PATH="$ISO_MNT/live/filesystem.squashfs"
+[[ -f "$SQUASHFS_PATH" ]] || { umount "$ISO_MNT" 2>/dev/null; rmdir "$ISO_MNT"; error "Not a Kali live ISO — missing live/filesystem.squashfs"; }
+info "Kali ISO mounted: $ISO_PATH"
+info "  Squashfs: $(du -h "$SQUASHFS_PATH" | cut -f1)"
+
+# Mount Debian ISO if provided (for offline signed GRUB)
+DEBIAN_ISO_MNT=""
+DEBIAN_SIGNED_GRUB_DEB=""
+if [[ -n "$DEBIAN_ISO_PATH" ]]; then
+    [[ -f "$DEBIAN_ISO_PATH" ]] || error "Debian ISO not found: $DEBIAN_ISO_PATH"
+    DEBIAN_ISO_MNT="/tmp/.debian-iso-$$"
+    mkdir -p "$DEBIAN_ISO_MNT"
+    mount -o loop,ro "$DEBIAN_ISO_PATH" "$DEBIAN_ISO_MNT" || error "Failed to mount Debian ISO: $DEBIAN_ISO_PATH"
+    DEBIAN_SIGNED_GRUB_DEB=$(find "$DEBIAN_ISO_MNT/pool/" -name "grub-efi-amd64-signed_*.deb" 2>/dev/null | head -1)
+    if [[ -n "$DEBIAN_SIGNED_GRUB_DEB" ]]; then
+        info "Debian ISO mounted: $DEBIAN_ISO_PATH"
+        info "  Found signed GRUB: $(basename "$DEBIAN_SIGNED_GRUB_DEB")"
+    else
+        warn "Debian ISO mounted but grub-efi-amd64-signed not found — will download from internet."
+    fi
+fi
+
 info "Target disk: $DISK -> $(readlink -f "$DISK")"
+info "Kali ISO:    $ISO_PATH"
+[[ -n "$DEBIAN_ISO_PATH" ]] && info "Debian ISO:  $DEBIAN_ISO_PATH"
 info "Log file:    $LOGFILE"
 info "Transcript:  $TYPESCRIPT"
 if $RESUME; then
@@ -404,19 +443,44 @@ fi  # end Phase 3
 if skip_phase 4; then
     info "PHASE 4: Install Kali Base System — SKIPPED (already completed)"
 else
-phase "PHASE 4: Install Kali Base System (debootstrap)"
+phase "PHASE 4: Install Kali Base System (ISO squashfs extraction)"
 
-# Work around CachyOS debootstrap bug: pacman-conf Architecture returns
-# multiple lines (x86_64, x86_64_v2, x86_64_v3) which breaks debootstrap's
-# HOST_ARCH detection. Writing the arch file makes debootstrap skip pacman-conf.
-echo "amd64" > /usr/share/debootstrap/arch
+info "Extracting squashfs from Kali ISO to ZFS root..."
+info "Source: $SQUASHFS_PATH"
+info "Target: $MNT"
+unsquashfs -f -d "$MNT" "$SQUASHFS_PATH"
 
-info "Running debootstrap for kali-rolling..."
-debootstrap --arch=amd64 "$KALI_SUITE" "$MNT" "$KALI_MIRROR"
+# Clean up live-system artifacts that don't belong on an installed system
+info "Cleaning up live-system artifacts..."
+rm -f "$MNT/etc/hostname" 2>/dev/null || true
+# Remove live-specific packages list and auto-login configs
+rm -rf "$MNT/etc/live" 2>/dev/null || true
+rm -f "$MNT/etc/lightdm/lightdm.conf" 2>/dev/null || true
+# Remove live user if it exists
+chroot "$MNT" userdel -r kali 2>/dev/null || true
+# Clear machine-id so a new one is generated on first boot
+: > "$MNT/etc/machine-id"
 
 # Copy zpool cache
 mkdir -p "$MNT/etc/zfs"
 cp /etc/zfs/zpool.cache "$MNT/etc/zfs/" 2>/dev/null || true
+
+# Copy the ISO's local apt repo into the chroot for offline package installs
+# (contains GRUB, shim, firmware, initramfs-tools, etc.)
+if [[ -d "$ISO_MNT/pool" && -d "$ISO_MNT/dists" ]]; then
+    info "Copying ISO apt repo into chroot for offline installs..."
+    mkdir -p "$MNT/opt/iso-repo"
+    cp -a "$ISO_MNT/pool" "$MNT/opt/iso-repo/"
+    cp -a "$ISO_MNT/dists" "$MNT/opt/iso-repo/"
+    info "  ISO repo copied to /opt/iso-repo/ ($(du -sh "$MNT/opt/iso-repo" | cut -f1))"
+fi
+
+# Copy Debian signed GRUB deb if available
+if [[ -n "$DEBIAN_SIGNED_GRUB_DEB" ]]; then
+    info "Copying Debian signed GRUB deb into chroot..."
+    mkdir -p "$MNT/opt/iso-repo/debian-signed"
+    cp "$DEBIAN_SIGNED_GRUB_DEB" "$MNT/opt/iso-repo/debian-signed/"
+fi
 mark_phase 4
 fi  # end Phase 4
 
@@ -507,7 +571,14 @@ fi
 HOOKEOF
 chmod +x /etc/initramfs-tools/hooks/zfs-hostid
 
-echo "[chroot] Updating packages..."
+# ── Add ISO local repo as apt source (offline packages) ─────────────────────
+if [[ -d /opt/iso-repo/pool ]]; then
+    echo "[chroot] Configuring ISO local repo as apt source..."
+    echo "deb [trusted=yes] file:///opt/iso-repo kali-rolling main contrib non-free non-free-firmware" \
+        > /etc/apt/sources.list.d/iso-local.list
+fi
+
+echo "[chroot] Updating package lists..."
 apt-get update
 
 mkdir -p /etc/apt/apt.conf.d
@@ -515,10 +586,8 @@ cat > /etc/apt/apt.conf.d/99-noninteractive <<'APTEOF'
 Dpkg::Options { "--force-confdef"; "--force-confold"; }
 APTEOF
 
-echo "[chroot] Installing core packages..."
-apt_retry install --yes --no-install-recommends \
-    locales console-setup keyboard-configuration tzdata
-
+# ── Locale & timezone (squashfs already has packages, just configure) ────────
+echo "[chroot] Configuring locale and timezone..."
 sed -i 's/^# *en_US.UTF-8/en_US.UTF-8/' /etc/locale.gen
 locale-gen
 update-locale LANG=en_US.UTF-8
@@ -569,18 +638,19 @@ apt_retry() {
     echo "[chroot] apt-get failed after $max_attempts attempts"; return 1
 }
 
-echo "[chroot] Installing ZFS and kernel..."
-apt_retry install --yes linux-headers-amd64
-apt_retry install --yes linux-image-amd64
+echo "[chroot] Installing ZFS packages (requires internet)..."
 apt_retry install --yes zfs-initramfs zfsutils-linux
 mkdir -p /etc/dkms
 echo "REMAKE_INITRD=yes" > /etc/dkms/zfs.conf
+
+echo "[chroot] Ensuring kernel headers are installed (needed for ZFS DKMS)..."
+# The squashfs already has the kernel image; we just need headers for DKMS
+apt_retry install --yes linux-headers-amd64
 
 echo "[chroot] Installing NTP..."
 apt_retry install --yes systemd-timesyncd
 
 echo "[chroot] Setting up ESP and GRUB..."
-apt_retry install --yes dosfstools
 mkdir -p /boot/efi
 
 ESP_UUID=$(blkid -s UUID -o value "$PART_ESP")
@@ -590,40 +660,48 @@ grep -q "$ESP_UUID" /etc/fstab 2>/dev/null || \
 mountpoint -q /boot/efi || mount /boot/efi
 
 echo "[chroot] Installing GRUB + Secure Boot shim (Microsoft-trusted signing chain)..."
-# Kali doesn't package grub-efi-amd64-signed (version mismatch with Debian).
-# Strategy: install Kali's GRUB + Debian's signed binary extracted from the .deb.
-#
-# grub-efi-amd64         — provides grub-install and GRUB tools
-# shim-signed            — Microsoft UEFI 3rd-party CA signed bootloader
-# sbsigntool             — verify PE/COFF Secure Boot signatures
-# mokutil                — query/manage Machine Owner Key state
+# grub-efi-amd64 and shim-signed come from ISO local repo (offline).
+# sbsigntool may need internet if not in ISO repo.
 apt_retry install --yes \
     grub-efi-amd64 \
     shim-signed \
-    sbsigntool \
     mokutil
+apt_retry install --yes sbsigntool 2>/dev/null || \
+    echo "[chroot] WARNING: sbsigntool not available — signature verification will be skipped"
 
 # Fetch Debian's signed GRUB binary (signed with Debian's key, trusted by shim)
 if [[ ! -f /usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed ]]; then
-    echo "[chroot] Downloading grub-efi-amd64-signed from Debian..."
-    echo "deb http://deb.debian.org/debian trixie main" > /etc/apt/sources.list.d/debian-trixie.list
-    cat > /etc/apt/preferences.d/debian-trixie.pref <<'PINEOF'
+    if [[ -d /opt/iso-repo/debian-signed ]] && ls /opt/iso-repo/debian-signed/grub-efi-amd64-signed_*.deb &>/dev/null; then
+        # Extract from Debian ISO (offline)
+        echo "[chroot] Extracting grub-efi-amd64-signed from Debian ISO (offline)..."
+        mkdir -p /tmp/grub-signed-extract
+        dpkg-deb --extract /opt/iso-repo/debian-signed/grub-efi-amd64-signed_*.deb /tmp/grub-signed-extract
+        mkdir -p /usr/lib/grub/x86_64-efi-signed
+        cp /tmp/grub-signed-extract/usr/lib/grub/x86_64-efi-signed/* /usr/lib/grub/x86_64-efi-signed/
+        rm -rf /tmp/grub-signed-extract
+        echo "[chroot] Signed GRUB binary extracted from Debian ISO."
+    else
+        # Download from Debian Trixie (requires internet)
+        echo "[chroot] Downloading grub-efi-amd64-signed from Debian Trixie..."
+        echo "deb http://deb.debian.org/debian trixie main" > /etc/apt/sources.list.d/debian-trixie.list
+        cat > /etc/apt/preferences.d/debian-trixie.pref <<'PINEOF'
 Package: *
 Pin: release o=Debian,n=trixie
 Pin-Priority: 100
 PINEOF
-    apt-get update -qq
-    cd /tmp
-    apt-get download grub-efi-amd64-signed
-    mkdir -p /tmp/grub-signed-extract
-    dpkg-deb --extract grub-efi-amd64-signed_*.deb /tmp/grub-signed-extract
-    mkdir -p /usr/lib/grub/x86_64-efi-signed
-    cp /tmp/grub-signed-extract/usr/lib/grub/x86_64-efi-signed/* /usr/lib/grub/x86_64-efi-signed/
-    rm -rf /tmp/grub-signed-extract /tmp/grub-efi-amd64-signed_*.deb
-    # Clean up Debian source (no longer needed)
-    rm -f /etc/apt/sources.list.d/debian-trixie.list /etc/apt/preferences.d/debian-trixie.pref
-    apt-get update -qq
-    echo "[chroot] Signed GRUB binary extracted successfully."
+        apt-get update -qq
+        cd /tmp
+        apt-get download grub-efi-amd64-signed
+        mkdir -p /tmp/grub-signed-extract
+        dpkg-deb --extract grub-efi-amd64-signed_*.deb /tmp/grub-signed-extract
+        mkdir -p /usr/lib/grub/x86_64-efi-signed
+        cp /tmp/grub-signed-extract/usr/lib/grub/x86_64-efi-signed/* /usr/lib/grub/x86_64-efi-signed/
+        rm -rf /tmp/grub-signed-extract /tmp/grub-efi-amd64-signed_*.deb
+        # Clean up Debian source (no longer needed)
+        rm -f /etc/apt/sources.list.d/debian-trixie.list /etc/apt/preferences.d/debian-trixie.pref
+        apt-get update -qq
+        echo "[chroot] Signed GRUB binary downloaded and extracted."
+    fi
 fi
 
 echo "[chroot] Removing os-prober (not needed)..."
@@ -666,12 +744,12 @@ mark_phase 6
 fi  # end Phase 5b
 
 ###############################################################################
-# PHASE 5c: Desktop & Packages (chroot) — largest download phase
+# PHASE 5c: KDE Plasma Desktop (chroot) — upgrade from XFCE
 ###############################################################################
 if skip_phase 7; then
-    info "PHASE 5c: Desktop & Packages — SKIPPED (already completed)"
+    info "PHASE 5c: KDE Plasma Desktop — SKIPPED (already completed)"
 else
-phase "PHASE 5c: Desktop Environment & Packages"
+phase "PHASE 5c: KDE Plasma Desktop (upgrade from ISO's XFCE)"
 
 setup_chroot_mounts
 
@@ -695,41 +773,22 @@ apt_retry() {
     echo "[chroot] apt-get failed after $max_attempts attempts"; return 1
 }
 
-echo "[chroot] Installing NetworkManager + firmware..."
-apt_retry install --yes \
-    network-manager \
-    firmware-linux \
-    firmware-linux-nonfree \
-    firmware-misc-nonfree \
-    firmware-iwlwifi \
-    firmware-realtek \
-    firmware-atheros \
-    wireless-tools \
-    wpasupplicant
+# The squashfs already provides: network-manager, firmware-*, wireless-tools,
+# wpasupplicant, kali-linux-default, kali-tools-top10, openssh-server, sudo,
+# vim, curl, wget, git, htop, tmux, pciutils, usbutils, bash-completion,
+# and XFCE4 desktop. We replace XFCE with KDE Plasma.
 
-echo "[chroot] Installing KDE Plasma + Kali tools..."
-echo "[chroot] This is the largest download (~8-15 GB) — may take a while..."
-apt_retry install --yes \
-    kali-desktop-kde \
-    kali-linux-default \
-    kali-tools-top10
+echo "[chroot] Installing KDE Plasma desktop..."
+echo "[chroot] This is the largest download — may take a while..."
+apt_retry install --yes kali-desktop-kde
 
-echo "[chroot] Installing extra useful packages..."
+echo "[chroot] Setting SDDM as default display manager..."
+echo "/usr/bin/sddm" > /etc/X11/default-display-manager
+dpkg-reconfigure -f noninteractive sddm 2>/dev/null || true
+
+echo "[chroot] Installing extra packages (if not already present)..."
 apt_retry install --yes \
-    openssh-server \
-    sudo \
-    vim \
-    curl \
-    wget \
-    git \
-    htop \
-    tmux \
     efibootmgr \
-    pciutils \
-    usbutils \
-    lsof \
-    net-tools \
-    bash-completion \
     plymouth \
     plymouth-themes
 
@@ -1183,6 +1242,11 @@ fi  # end Phase 6
 ###############################################################################
 phase "PHASE 7: Snapshot & Cleanup"
 
+# Remove ISO local repo from installed system (no longer needed, saves space)
+info "Cleaning up ISO local repo from installed system..."
+rm -rf "$MNT/opt/iso-repo" 2>/dev/null || true
+rm -f "$MNT/etc/apt/sources.list.d/iso-local.list" 2>/dev/null || true
+
 # Take initial snapshots
 info "Creating initial snapshots..."
 zfs snapshot bpool/BOOT/kali@install
@@ -1199,6 +1263,11 @@ umount -lf "$MNT/run" 2>/dev/null || true
 info "Exporting ZFS pools..."
 zpool export bpool || warn "Could not export bpool cleanly"
 zpool export rpool || warn "Could not export rpool cleanly"
+
+# Unmount ISOs
+info "Unmounting ISOs..."
+[[ -n "${ISO_MNT:-}" ]] && umount "$ISO_MNT" 2>/dev/null && rmdir "$ISO_MNT" 2>/dev/null || true
+[[ -n "${DEBIAN_ISO_MNT:-}" ]] && umount "$DEBIAN_ISO_MNT" 2>/dev/null && rmdir "$DEBIAN_ISO_MNT" 2>/dev/null || true
 
 # Mark all phases complete and remove state file (clean finish)
 mark_phase 11
