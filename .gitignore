@@ -4,8 +4,14 @@
 # Install state/checkpoint files
 .install-state-*
 
-# Log files
+# Log files (project-local logs/ directory)
+logs/*
+!logs/.gitkeep
 *.log
+*.typescript
 
 # VM test artifacts (virtual disks, OVMF vars, TPM state)
 test/.vm/
+
+# Backup files from refactoring
+*.bak

@@ -24,15 +24,31 @@ phase() {
     echo -e "${BOLD}${CYAN}══════════════════════════════════════════${NC}\n"
 }
 
+# ─── Log directory ──────────────────────────────────────────────────────────
+# Logs go to LOGDIR (default: ./logs/ relative to SCRIPT_DIR). Created
+# automatically. Falls back to /var/log/ if the directory is not writable.
+LOGDIR=""
+LOGFILE=""
+TYPESCRIPT=""
+
+setup_log_dir() {
+    local script_dir="${1:?Usage: setup_log_dir /path/to/script/dir}"
+    LOGDIR="$script_dir/logs"
+    mkdir -p "$LOGDIR" 2>/dev/null || {
+        LOGDIR="/var/log"
+        warn "Cannot create $script_dir/logs — falling back to /var/log/"
+    }
+}
+
 # ─── Script transcript capture ──────────────────────────────────────────────
-# Call this early in the main script. Re-execs through `script` to capture
-# the full raw terminal transcript.
+# Re-execs through `script` to capture the full raw terminal transcript.
+# Must be called AFTER setup_log_dir.
 #
-# Usage: setup_transcript "kali-zfs"
+# Usage: setup_transcript "kali-zfs" "$@"
 setup_transcript() {
-    local name="${1:?Usage: setup_transcript <name>}"
-    TYPESCRIPT="/var/log/install-${name}-$(date +%Y%m%d-%H%M%S).typescript"
-    export TYPESCRIPT
+    local name="${1:?Usage: setup_transcript <name>}"; shift
+    TYPESCRIPT="$LOGDIR/install-${name}-$(date +%Y%m%d-%H%M%S).typescript"
+    export TYPESCRIPT LOGDIR
     if [[ -z "${INSIDE_SCRIPT_WRAPPER:-}" ]]; then
         export INSIDE_SCRIPT_WRAPPER=1
         exec script -efq "$TYPESCRIPT" -c "$(printf '%q ' "$0" "$@")"
@@ -41,14 +57,14 @@ setup_transcript() {
 
 # ─── Log file setup ────────────────────────────────────────────────────────
 # Tees all stdout+stderr to a log file while still printing to terminal.
+# Must be called AFTER setup_log_dir.
 #
 # Usage: setup_logging "kali-zfs"
 setup_logging() {
     local name="${1:?Usage: setup_logging <name>}"
-    LOGFILE="/var/log/install-${name}-$(date +%Y%m%d-%H%M%S).log"
+    LOGFILE="$LOGDIR/install-${name}-$(date +%Y%m%d-%H%M%S).log"
     export LOGFILE
     exec > >(tee -a "$LOGFILE") 2>&1
-
     trap 'trap_handler "$LINENO" "$BASH_COMMAND" "$?"' ERR
 }
 
@@ -68,10 +84,23 @@ trap_handler() {
     exit "$rc"
 }
 
+# ─── Partition naming helper ───────────────────────────────────────────────
+# /dev/disk/by-id/X  → /dev/disk/by-id/X-partN
+# /dev/loopX         → /dev/loopXpN
+# /dev/sdX           → /dev/sdXN
+# /dev/nvmeXnY       → /dev/nvmeXnYpN
+part() {
+    local disk="$1" num="$2"
+    if [[ "$disk" == /dev/disk/by-* ]]; then
+        echo "${disk}-part${num}"
+    elif [[ "$disk" == /dev/loop* ]] || [[ "$disk" == /dev/nvme* ]]; then
+        echo "${disk}p${num}"
+    else
+        echo "${disk}${num}"
+    fi
+}
+
 # ─── Checkpoint / resume ───────────────────────────────────────────────────
-# Usage:
-#   init_resume "kali-zfs" "$@"   # parses --resume flag
-#   skip_phase 1 && info "skipped" || { ...; mark_phase 1; }
 STATEFILE=""
 RESUME=false
 
@@ -79,9 +108,7 @@ init_resume() {
     local name="${1:?}"; shift
     STATEFILE="/tmp/.install-state-${name}"
     for arg in "$@"; do
-        case "$arg" in
-            --resume) RESUME=true ;;
-        esac
+        [[ "$arg" == "--resume" ]] && RESUME=true
     done
 }
 
@@ -89,10 +116,7 @@ completed_phase() { cat "$STATEFILE" 2>/dev/null || echo 0; }
 mark_phase()      { echo "$1" > "$STATEFILE"; }
 skip_phase() {
     local n=$1
-    if $RESUME && (( n <= $(completed_phase) )); then
-        return 0
-    fi
-    return 1
+    $RESUME && (( n <= $(completed_phase) ))
 }
 
 # ─── Root check ─────────────────────────────────────────────────────────────
@@ -101,34 +125,35 @@ require_root() {
 }
 
 # ─── Disk resolution ───────────────────────────────────────────────────────
-# Tries each identifier in order, sets DISK and DISK_DEV.
-# Usage: resolve_disk "$DISK_WWN" "$DISK_ATA" "$DISK_USB"
-#   or:  resolve_disk --interactive   (prompts user to pick)
 DISK=""
 DISK_DEV=""
 
+# Usage: resolve_disk [--override=/dev/X] "$DISK_WWN" "$DISK_ATA" "$DISK_USB"
 resolve_disk() {
-    if [[ "${1:-}" == "--interactive" ]]; then
-        info "Available disks:"
-        lsblk -dpno NAME,SIZE,MODEL,TRAN | grep -v '^/dev/zram' | while read -r line; do
-            echo "  $line"
-        done
-        echo ""
-        read -rp "Enter disk path (e.g. /dev/sda) or by-id path: " DISK
-        [[ -b "$DISK" || -e "$DISK" ]] || error "Not a valid block device: $DISK"
-        DISK_DEV="$(readlink -f "$DISK")"
-        return
-    fi
-
-    for candidate in "$@"; do
-        if [[ -n "$candidate" && -e "$candidate" ]]; then
-            DISK="$candidate"
-            DISK_DEV="$(readlink -f "$DISK")"
-            info "Disk found: $DISK -> $DISK_DEV"
-            return
-        fi
+    local override=""
+    local -a candidates=()
+    for arg in "$@"; do
+        case "$arg" in
+            --override=*) override="${arg#--override=}" ;;
+            *) candidates+=("$arg") ;;
+        esac
     done
-    error "Disk not found via any known identifier. Is the drive plugged in?"
+
+    if [[ -n "$override" ]]; then
+        [[ -e "$override" ]] || error "Disk override not found: $override"
+        DISK="$override"
+        info "Disk set via --disk= override: $DISK"
+    else
+        for candidate in "${candidates[@]}"; do
+            if [[ -n "$candidate" && -e "$candidate" ]]; then
+                DISK="$candidate"
+                info "Disk found: $DISK"
+                break
+            fi
+        done
+    fi
+    [[ -n "$DISK" ]] || error "Disk not found via any known identifier. Is the drive plugged in?\n  Tip: use --disk=/dev/sdX or --disk=/dev/loop0 for testing."
+    DISK_DEV="$(readlink -f "$DISK")"
 }
 
 # ─── ZFS module check ──────────────────────────────────────────────────────
@@ -137,14 +162,13 @@ require_zfs() {
 }
 
 # ─── Tool checks ───────────────────────────────────────────────────────────
-# Usage: require_commands sgdisk zpool zfs debootstrap mkdosfs chroot
 require_commands() {
     for cmd in "$@"; do
         command -v "$cmd" &>/dev/null || error "Missing required command: $cmd"
     done
 }
 
-# Try to install a package by name (auto-detects package manager on host)
+# Try to install a package by name (auto-detects host package manager)
 host_install_package() {
     local pkg="$1"
     info "$pkg not found — attempting install..."
@@ -160,7 +184,6 @@ host_install_package() {
 }
 
 # ─── Chroot helpers ─────────────────────────────────────────────────────────
-# Bind-mount virtual filesystems for chroot
 setup_chroot_mounts() {
     local mnt="${1:?Usage: setup_chroot_mounts /mnt/target}"
     mountpoint -q "$mnt/dev"  || mount --make-private --rbind /dev  "$mnt/dev"
@@ -169,9 +192,8 @@ setup_chroot_mounts() {
     cp /etc/resolv.conf "$mnt/etc/resolv.conf" 2>/dev/null || true
 }
 
-# ─── APT retry wrapper (for use inside heredoc chroot scripts) ──────────────
-# This function is meant to be COPIED into chroot scripts as text,
-# not called directly from the host. See generate_apt_retry_func().
+# ─── APT retry function text ───────────────────────────────────────────────
+# Outputs the apt_retry function as text for embedding in chroot heredocs.
 generate_apt_retry_func() {
     cat <<'RETRY_FUNC'
 apt_retry() {
@@ -187,28 +209,57 @@ RETRY_FUNC
 }
 
 # ─── Confirmation prompt ───────────────────────────────────────────────────
-# Usage: confirm_destructive "This will DESTROY ALL DATA on $DISK."
 confirm_destructive() {
-    local msg="${1:-This operation is destructive.}"
-    warn "$msg"
     echo ""
     read -rp "Type YES to continue: " confirm
     [[ "$confirm" == "YES" ]] || { echo "Aborted."; exit 0; }
 }
 
 # ─── Cleanup helpers ───────────────────────────────────────────────────────
-# Unmount a chroot tree and export ZFS pools
+# Unmount bind mounts (proc/sys/dev) FIRST, then other mounts, then ESP.
+# This correct ordering prevents "pool is busy" on zpool export.
 cleanup_mounts() {
     local mnt="${1:?}"
+
+    # 1. Unmount bind mounts (reverse order: sys, proc, dev)
+    for vfs in sys proc dev; do
+        umount -Rlf "$mnt/$vfs" 2>/dev/null || true
+    done
+
+    # 2. Unmount ESP
     umount -lf "$mnt/boot/efi" 2>/dev/null || true
-    mount | grep -v zfs | tac | awk -v m="$mnt" '$3 ~ m {print $3}' | \
-        xargs -I{} umount -lf {} 2>/dev/null || true
+
+    # 3. Unmount /run
     umount -lf "$mnt/run" 2>/dev/null || true
+
+    # 4. Unmount any remaining non-ZFS mounts under $mnt (in reverse order)
+    mount | grep -v zfs | tac | awk -v m="$mnt" '$3 ~ m {print $3}' | \
+        while read -r mp; do umount -lf "$mp" 2>/dev/null || true; done
 }
 
 export_pools() {
     for pool in "$@"; do
         info "Exporting $pool..."
-        zpool export "$pool" || warn "Could not export $pool cleanly"
+        zpool export "$pool" 2>/dev/null || {
+            warn "Normal export of $pool failed — force exporting..."
+            zpool export -f "$pool" 2>/dev/null || \
+                warn "Could not export $pool — may need reboot to clear"
+        }
+    done
+}
+
+# ─── ISO mount helpers ──────────────────────────────────────────────────────
+mount_iso() {
+    local iso_path="$1" var_name="$2"
+    [[ -f "$iso_path" ]] || error "ISO not found: $iso_path"
+    local mnt_path="/tmp/.iso-$$-$(basename "$iso_path" .iso)"
+    mkdir -p "$mnt_path"
+    mount -o loop,ro "$iso_path" "$mnt_path" || error "Failed to mount ISO: $iso_path"
+    eval "$var_name='$mnt_path'"
+}
+
+unmount_isos() {
+    for mnt in "$@"; do
+        [[ -n "$mnt" ]] && umount "$mnt" 2>/dev/null && rmdir "$mnt" 2>/dev/null || true
     done
 }
