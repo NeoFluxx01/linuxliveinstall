@@ -7,8 +7,8 @@
 ###############################################################################
 
 # Load bats helper libraries (installed via pacman on Arch/CachyOS)
-load '/usr/lib/bats-support/load'
-load '/usr/lib/bats-assert/load'
+load '/usr/lib/bats/bats-support/load'
+load '/usr/lib/bats/bats-assert/load'
 
 # Project root
 export PROJECT_DIR="${BATS_TEST_DIRNAME}/../.."
